@@ -1,0 +1,10 @@
+.DS_Store
+build/
+outputs/
+work/
+*.dmg
+*.app/
+*.log
+offserver*.txt
+*.jks
+keystore/

@@ -1,0 +1,1030 @@
+diff --git a/scripts/hadron-procs.sh b/scripts/hadron-procs.sh
+index 234bc31..4f76f02 100644
+--- a/scripts/hadron-procs.sh
++++ b/scripts/hadron-procs.sh
+@@ -15,11 +15,16 @@ hadron_candidates() {
+ # installed app, games run from a copy of the runtime, and "this runtime" is the copy the script
+ # was started from (scripts/runtime-versions.sh).
+ HADRON_REAL_ROOT="$(cd "$ROOT" && pwd -P)"
++if [ "${HADRON_PROCESS_SCOPE:-runtime}" = prefix ]; then
++    . "$ROOT/scripts/standalone-common.sh"
++    standalone_scope_valid || { echo "invalid standalone process scope" >&2; return 1; }
++else
+ # Two builds can be running side by side, each from its copy: the memory watchdog and
+ # scripts/stop mean all of them, so for a copy "this runtime" is the folder the copies are in.
+ case "$HADRON_REAL_ROOT" in
+     */runtimes/*) [ ! -f "$HADRON_REAL_ROOT/BUILD-ID" ] || HADRON_REAL_ROOT="${HADRON_REAL_ROOT%/*}" ;;
+ esac
++fi
+ 
+ # Whether process $1 belongs to this checkout.
+ is_hadron_process() {
+diff --git a/scripts/paths.sh b/scripts/paths.sh
+index 5f2c692..16c78f5 100644
+--- a/scripts/paths.sh
++++ b/scripts/paths.sh
+@@ -7,12 +7,12 @@
+ # run from (scripts/runtime-versions.sh), settings. HADRON_SUPPORT names another folder for a test.
+ HADRON_SUPPORT="${HADRON_SUPPORT:-$HOME/Library/Application Support/Hadron}"
+ if [ -d "$ROOT/build" ]; then
+-    HADRON_LOGS="$ROOT/build/logs"
++    HADRON_LOGS="${HADRON_LOGS:-$ROOT/build/logs}"
+     HADRON_VALVE="$ROOT/build/valve/bridge"
+     HADRON_PREFIX="$ROOT/prefix/release"
+     HADRON_OVERLAY_HELPER="$ROOT/build/notproton/overlay-shim.dylib"
+ else
+-    HADRON_LOGS="$HOME/Library/Logs/Hadron"
++    HADRON_LOGS="${HADRON_LOGS:-$HOME/Library/Logs/Hadron}"
+     HADRON_VALVE="$HADRON_SUPPORT/valve/bridge"
+     HADRON_PREFIX="$HADRON_SUPPORT/prefix"
+     HADRON_OVERLAY_HELPER="$ROOT/steam/overlay-shim.dylib"
+diff --git a/scripts/play b/scripts/play
+index f6faaee..4c69ed5 100755
+--- a/scripts/play
++++ b/scripts/play
+@@ -3,6 +3,7 @@
+ # Mac Steam must be running and logged in.
+ #
+ # Usage: scripts/play <appid> <path/to/game.exe> [game args...]
++# HADRON_STANDALONE=1 is used by scripts/standalone-run, without Steam.
+ #
+ # Only an allowlist of environment variables reaches the game: host secrets never do.
+ # HADRON_LOG=1 writes module load addresses and errors to the logs directory for crash analysis.
+@@ -22,11 +23,18 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
+ appid="$1"; exe="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; shift 2
+ # Steam starts a game in the working directory its launch entry names, and scripts/steam-run
+ # keeps it. Run by hand, the game starts in its own directory.
+-[ -n "${STEAM_COMPAT_DATA_PATH:-}" ] || cd "$(dirname "$exe")" || exit 1
++if [ "${HADRON_STANDALONE:-0}" = 1 ]; then
++    case "$appid" in ''|*[!A-Za-z0-9_-]*) echo "invalid standalone id" >&2; exit 2 ;; esac
++    cd "${HADRON_WORKDIR:-$(dirname "$exe")}" || exit 1
++else
++    [ -n "${STEAM_COMPAT_DATA_PATH:-}" ] || cd "$(dirname "$exe")" || exit 1
++fi
+ 
+-MAC_STEAM="$HOME/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS"
+-[ -f "$MAC_STEAM/steamclient.dylib" ] || { echo "Mac Steam not found at $MAC_STEAM" >&2; exit 1; }
+-pgrep -q steam_osx || echo "warning: Mac Steam doesn't seem to be running" >&2
++if [ "${HADRON_STANDALONE:-0}" != 1 ]; then
++    MAC_STEAM="$HOME/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS"
++    [ -f "$MAC_STEAM/steamclient.dylib" ] || { echo "Mac Steam not found at $MAC_STEAM" >&2; exit 1; }
++    pgrep -q steam_osx || echo "warning: Mac Steam doesn't seem to be running" >&2
++fi
+ 
+ winexe="Z:$(printf '%s' "$exe" | tr '/' '\\')"
+ . "$ROOT/scripts/paths.sh"
+@@ -39,7 +47,9 @@ install_dll() {  # <dist arch dir> <prefix system dir> <dll>
+     src="$ROOT/dist/lib/wine/$1/$3"; dst="$PREFIX/drive_c/windows/$2/$3"
+     if [ -f "$src" ] && [ -d "$(dirname "$dst")" ] && ! cmp -s "$src" "$dst"; then cp "$src" "$dst"; fi
+ }
+-for dll in lsteamclient.dll winemetal.dll; do
++dlls="lsteamclient.dll winemetal.dll"
++[ "${HADRON_STANDALONE:-0}" != 1 ] || dlls=winemetal.dll
++for dll in $dlls; do
+     install_dll aarch64-windows system32 "$dll"
+     install_dll i386-windows syswow64 "$dll"
+ done
+@@ -54,6 +64,9 @@ case "${HADRON_DISABLE_LSTEAMCLIENT:-0}" in
+     0) ;;
+     *) overrides="mscoree,mshtml=;steamclient,steamclient64=d;lsteamclient=b" ;;
+ esac
++if [ "${HADRON_STANDALONE:-0}" = 1 ]; then
++    overrides="mshtml="
++fi
+ # D3D9 goes through mtld3d (D3D9 -> Metal), installed in the prefix by scripts/mtld3d-prefix
+ # enable; HADRON_D3D9=wined3d uses Wine's own D3D9 (over OpenGL) instead, for comparisons.
+ [ "${HADRON_D3D9:-mtld3d}" = mtld3d ] && overrides="$overrides;d3d9=n,b"
+@@ -160,14 +173,18 @@ fi
+ 
+ # Renderer and translator settings (a game's Steam launch options, or the caller's environment) pass
+ # through by name; the variables set explicitly below keep their computed values.
+-set -- "$wine" "$ROOT/dist/lib/wine/aarch64-windows/hadron-steam.exe" "$winexe" "$@"
++if [ "${HADRON_STANDALONE:-0}" = 1 ]; then
++    set -- "$wine" "$winexe" "$@"
++else
++    set -- "$wine" "$ROOT/dist/lib/wine/aarch64-windows/hadron-steam.exe" "$winexe" "$@"
++fi
+ for var in $(env | grep -oE '^(WINE[A-Z0-9_]*|(DXMT|MTLD3D|MTL|DXVK|VKD3D|FEX|MESA)_[A-Za-z0-9_]*)=' | tr -d = | sort -u); do
+     case "$var" in
+         WINEPREFIX|WINELOADER|WINEDEBUG|WINEDLLOVERRIDES|WINE_LARGE_ADDRESS_AWARE|WINE_MAC_OPENGL|MESA_LOADER_DRIVER_OVERRIDE|MTLD3D_CONFIG|MTLD3D_NO_CRASH_HANDLER|FEX_DISKCACHE|FEX_BLOCKJITNAMING) continue ;;
+         VKD3D_SHADER_CACHE_PATH) [ -n "${vkd3d_cache:-}" ] && continue ;;
+         VKD3D_SWAPCHAIN_MIN_LATENCY_FRAMES) continue ;;
+     esac
+-    eval "value=\${$var}"
++    value=$(printenv "$var")
+     set -- "$var=$value" "$@"
+ done
+ # Paths may contain spaces (Steam runs this through ~/Library/Application Support), so these go
+@@ -203,7 +220,7 @@ set -- "VKD3D_SWAPCHAIN_MIN_LATENCY_FRAMES=${VKD3D_SWAPCHAIN_MIN_LATENCY_FRAMES:
+ # NotProton's overlay helper goes in with it: the overlay hooks only Metal 3's present calls, and
+ # the helper shows it the frames KosmicKrisp presents through a Metal 4 queue. lsteamclient
+ # looks for the helper under NOTPROTON_OVERLAY_SHIM and leaves the overlay alone when it is in.
+-if [ -n "${STEAM_DYLD_INSERT_LIBRARIES:-}" ]; then
++if [ "${HADRON_STANDALONE:-0}" != 1 ] && [ -n "${STEAM_DYLD_INSERT_LIBRARIES:-}" ]; then
+     insert="$STEAM_DYLD_INSERT_LIBRARIES"
+     if [ -f "$HADRON_OVERLAY_HELPER" ]; then
+         insert="$HADRON_OVERLAY_HELPER:$insert"
+@@ -212,6 +229,18 @@ if [ -n "${STEAM_DYLD_INSERT_LIBRARIES:-}" ]; then
+     set -- "DYLD_INSERT_LIBRARIES=$insert" "$@"
+ fi
+ 
++if [ "${HADRON_STANDALONE:-0}" != 1 ]; then
++    set -- "SteamAppId=$appid" "SteamGameId=$appid" \
++        "STEAM_COMPAT_CLIENT_INSTALL_PATH=$MAC_STEAM" \
++        "STEAM_DYLD_INSERT_LIBRARIES=$STEAM_DYLD_INSERT_LIBRARIES" \
++        ${SteamOverlayGameId:+"SteamOverlayGameId=$SteamOverlayGameId"} \
++        ${SteamClientLaunch:+"SteamClientLaunch=$SteamClientLaunch"} \
++        ${SteamEnv:+"SteamEnv=$SteamEnv"} "$@"
++fi
++[ -z "$dxmt_config" ] || set -- "DXMT_CONFIG=$dxmt_config" "$@"
++[ -z "${LC_ALL:-}" ] || set -- "LC_ALL=$LC_ALL" "$@"
++[ -z "${DOTNET_BUNDLE_EXTRACT_BASE_DIR:-}" ] || set -- "DOTNET_BUNDLE_EXTRACT_BASE_DIR=$DOTNET_BUNDLE_EXTRACT_BASE_DIR" "$@"
++
+ exec env -i HOME="$HOME" USER="$USER" LANG="${LANG:-en_US.UTF-8}" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+     TMPDIR="${TMPDIR:-/tmp}" \
+     WINEPREFIX="$PREFIX" \
+@@ -223,15 +252,9 @@ exec env -i HOME="$HOME" USER="$USER" LANG="${LANG:-en_US.UTF-8}" PATH=/usr/bin:
+     WINE_LARGE_ADDRESS_AWARE="${HADRON_LARGE_ADDRESS_AWARE:-1}" \
+     MTLD3D_NO_CRASH_HANDLER=1 \
+     MTLD3D_CONFIG="$mtld3d_config" \
+-    ${dxmt_config:+DXMT_CONFIG=$dxmt_config} \
+     ${RUST_LOG:+RUST_LOG=$RUST_LOG} \
+-    SteamAppId="$appid" SteamGameId="$appid" \
+-    STEAM_COMPAT_CLIENT_INSTALL_PATH="$MAC_STEAM" \
+     ${HADRON_DISABLE_LSTEAMCLIENT:+HADRON_DISABLE_LSTEAMCLIENT=$HADRON_DISABLE_LSTEAMCLIENT} \
+     ${HADRON_HARDWARE_TSO:+HADRON_HARDWARE_TSO=$HADRON_HARDWARE_TSO} \
+     ${HADRON_PRECISE_SCROLLING:+HADRON_PRECISE_SCROLLING=$HADRON_PRECISE_SCROLLING} \
+     ${FEX_BLOCKJITNAMING:+FEX_BLOCKJITNAMING=$FEX_BLOCKJITNAMING} \
+-    STEAM_DYLD_INSERT_LIBRARIES="$STEAM_DYLD_INSERT_LIBRARIES" \
+-    ${SteamOverlayGameId:+SteamOverlayGameId=$SteamOverlayGameId} \
+-    ${SteamClientLaunch:+SteamClientLaunch=$SteamClientLaunch} ${SteamEnv:+SteamEnv=$SteamEnv} \
+     "$@"
+diff --git a/scripts/runtime-versions.sh b/scripts/runtime-versions.sh
+index 74b8336..da5a8c7 100644
+--- a/scripts/runtime-versions.sh
++++ b/scripts/runtime-versions.sh
+@@ -201,7 +201,7 @@ runtime_choose() {
+     _chosen=$(runtime_of_launch)
+     [ -n "$_chosen" ] || _chosen=$(runtime_of_session)
+     [ -n "$_chosen" ] || _chosen=$(runtime_latest "$1")
+-    if [ -n "$_chosen" ] && [ "$_chosen" != "$1" ] && [ -x "$_chosen/scripts/steam-run" ]; then
++    if [ -n "$_chosen" ] && [ "$_chosen" != "$1" ] && [ -x "$_chosen/scripts/${HADRON_RUNTIME_ENTRYPOINT:-steam-run}" ]; then
+         runtime_mark "$_chosen"
+         runtime_unmark "$1"
+         printf '%s\n' "$_chosen"
+diff --git a/scripts/stop b/scripts/stop
+index 299e6c6..09d2648 100755
+--- a/scripts/stop
++++ b/scripts/stop
+@@ -2,6 +2,23 @@
+ # Stop every Hadron Wine process (all prefixes), including orphans whose wineserver is gone.
+ # Leaves the native Mac Steam client and other Wine installations alone (see hadron-procs.sh).
+ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
++if [ "${HADRON_PROCESS_SCOPE:-runtime}" = prefix ]; then
++    . "$ROOT/scripts/standalone-common.sh"
++    standalone_scope_valid || { echo "stop: refusing invalid prefix scope" >&2; exit 2; }
++    target=$(standalone_active_prefix) || exit 2
++    printf '%s\n' "prefix-scoped stop" > "$HADRON_SCOPE_DIR/stop-request"
++    standalone_wine "$target" "$ROOT/dist/bin/wineserver" -k || exit 1
++    sleep 1
++    . "$ROOT/scripts/hadron-procs.sh" || exit 2
++    # The runtime directory is private to this exact prefix. Re-check both the
++    # PID start time and mapped runtime before terminating any orphan.
++    hadron_candidates | while read -r p rss start; do
++        is_hadron_process "$p" || continue
++        current=$(ps -p "$p" -o lstart= 2>/dev/null | tr -d ' :')
++        [ "$current" = "$start" ] && is_hadron_process "$p" && kill -9 "$p" 2>/dev/null
++    done
++    exit 0
++fi
+ for p in "$ROOT"/prefix/*; do
+     [ -d "$p" ] || continue
+     WINEPREFIX="$p" "$ROOT/dist/bin/wineserver" -k 2>/dev/null
+diff --git a/scripts/watchdog b/scripts/watchdog
+index 78ec18f..a6ef6d4 100755
+--- a/scripts/watchdog
++++ b/scripts/watchdog
+@@ -20,7 +20,7 @@ mem_limit_mb=$(( ${HADRON_MEM_LIMIT_GB:-$(( ram_gb / 2 ))} * 1024 ))
+ swap_limit_mb=${HADRON_SWAP_LIMIT_MB:-2048}
+ disk_min_mb=$(( ${HADRON_DISK_MIN_GB:-5} * 1024 ))
+ 
+-. "$ROOT/scripts/hadron-procs.sh"
++. "$ROOT/scripts/hadron-procs.sh" || exit 2
+ 
+ # Processes already classified, as pid:start keys, so lsof runs once per process rather than
+ # every second; the start time keeps a reused PID from inheriting its predecessor's answer.
+@@ -69,7 +69,9 @@ while kill -0 "$pid" 2>/dev/null; do
+     [ "$disk" -lt "$disk_min_mb" ] && reason="only ${disk} MB of disk left"
+     if [ -n "$reason" ]; then
+         echo "watchdog: $reason, stopping the game" | tee -a "$log" >&2
+-        osascript -e "display notification \"$reason\" with title \"Hadron stopped the game\"" 2>/dev/null
++        if [ "${HADRON_PROCESS_SCOPE:-runtime}" != prefix ]; then
++            osascript -e "display notification \"$reason\" with title \"Hadron stopped the game\"" 2>/dev/null
++        fi
+         "$ROOT/scripts/stop" >> "$log" 2>&1
+         exit 1
+     fi
+diff --git a/tests/mac/test-runtime-versions.sh b/tests/mac/test-runtime-versions.sh
+index 0db7763..820e61f 100755
+--- a/tests/mac/test-runtime-versions.sh
++++ b/tests/mac/test-runtime-versions.sh
+@@ -170,5 +170,15 @@ check "a lock whose holder was killed is free" runtime_lock
+ check "at once" test $(( $(date +%s) - start )) -le 2
+ runtime_unlock
+ 
++echo "--- a standalone entry point"
++app "$T/standalone" 4.0-standalone
++rm "$T/standalone/scripts/steam-run"
++printf '#!/bin/sh\n' > "$T/standalone/scripts/standalone-run"
++chmod +x "$T/standalone/scripts/standalone-run"
++standalone_choice=$(HADRON_RUNTIME_ENTRYPOINT=standalone-run sh -c '
++    ROOT=x; . "$1/scripts/paths.sh"; . "$1/scripts/runtime-versions.sh"
++    runtime_choose "$2"' sh "$REPO" "$T/standalone")
++check "standalone runtime needs no Steam entry point" test "$standalone_choice" = "$HADRON_RUNTIMES/4.0-standalone"
++
+ echo
+ if [ "$failures" -eq 0 ]; then echo "all passed"; else echo "$failures failed"; exit 1; fi
+diff --git a/docs/standalone.md b/docs/standalone.md
+new file mode 100644
+index 0000000..9cedb16
+--- /dev/null
++++ b/docs/standalone.md
+@@ -0,0 +1,99 @@
++# Standalone Windows sessions
++
++This downstream adapter adds a non-Steam entry point around the existing `play`
++graphics path. It does not patch a game's executables or replace its launcher.
++The Steam path stays the default. Wine, FEX and the graphics DLLs remain the
++unmodified signed 0.3.0 runtime used for the CPU probes.
++
++## Interface
++
++```sh
++WINEPREFIX="$HOME/Library/Application Support/Hadron Standalone/prefixes/example" \
++HADRON_SUPPORT="$HOME/Library/Application Support/Hadron Standalone" \
++HADRON_LOGS="$HOME/Library/Logs/Hadron Standalone" \
++  /path/to/runtime/scripts/standalone-run example /absolute/path/Launcher.exe arg1
++```
++
++The runtime must carry a BUILD-ID and the adapter's scripts. In this workspace,
++`python3 tools/probe/stage_t2.py` stages that tree from the verified runtime and
++the source-controlled scripts without writing through the signed loader links.
++Python and the cross compiler are development tools, not launch dependencies.
++
++The ID accepts ASCII letters, digits, `_` and `-`. The EXE, prefix, support and
++log paths must be absolute. The prefix must not be a symlink. `HADRON_WORKDIR`
++optionally selects the Windows process's working directory; otherwise its EXE
++directory is used. Arguments remain separate argv entries, never shell code.
++
++`standalone-run` cleans its environment before selecting a runtime. It retains
++explicit launch, renderer and translator settings, plus the real HOME/USER and
++system paths. It removes Steam IDs, overlay injection and unrelated host
++variables. `play` then runs the EXE directly instead of `hadron-steam.exe`, and
++does not stage lsteamclient or send Steam variables to Wine.
++
++## Isolation, locking and lifetime
++
++Each canonical prefix path gets a scope at
++`<support>/prefix-sessions/<md5-of-prefix>/`. The `owner-prefix` file confirms the
++exact path as well as the hash. Each scope has its **own APFS runtime copies**,
++under `runtimes/<BUILD-ID>`, and a `runtime` link. This costs directory entries
++and metadata; APFS clones share unchanged data blocks.
++
++Private runtime paths allow the watchdog to classify a process using mapped
++files. There is no need to read other processes' environment blocks. Prefix
++mode does not broaden the scope to all builds or other prefixes. Stop validates
++the owner-prefix and runtime location, calls that prefix's wineserver, and only
++then handles orphans whose PID start time and mapped private runtime still match.
++
++A sibling lock `.<prefix-name>.hadron-session.lock` prevents duplicate sessions
++even when callers supply different support directories. It stays outside the
++prefix so initialization can rename the staging folder. The supervisor keeps
++the lock; Wine children and the watchdog do not inherit its descriptor.
++
++Exactly one watchdog observes the supervisor throughout initialization and the
++whole session. The supervisor waits for both its initial EXE and wineserver's
++whole session, including a launcher that starts a child and exits. TERM/INT/HUP
++stop only this prefix. An app should retain the Process handle it created and
++send TERM to it; the `supervisor-pid` file is a diagnostic last-PID record, not
++proof that that PID is still the same process.
++
++Exit 75 means a session is already running or an unmanaged Wine session exists.
++Exit 2 indicates invalid paths/arguments/scope or an unsupported deep runtime
++path; exit 1 indicates preparation failure. A requested stop returns 143.
++Otherwise the initial EXE's exit status is returned after its children finish.
++
++## Prefix creation and migration
++
++Only an absent prefix is initialized. Wine creates a disposable sibling
++`.hadron-new.<pid>` folder. The adapter waits for Wine, installs the existing
++mtld3d prefix libraries, checks ARM64 ntdll, writes the ready marker, and renames
++the folder into place. Failed initialization removes only its own staging folder.
++An existing incomplete or foreign prefix is refused without deleting its data.
++
++A changed runtime ID first produces a sibling APFS prefix snapshot. Migration
++uses wineboot --update after removing the prefix's FEX disk code cache (FEX keys
++that cache on host features and settings, not on its code generator; the snapshot
++keeps the old cache). An incomplete migration retains a marker containing its
++snapshot path and fails closed on the next launch. Rollback restores both the
++snapshot and matching old runtime. Runtime-only rollback is not assumed safe.
++Old runtime copies and snapshots are retained in T2; automatic pruning is not
++part of this adapter yet.
++
++## Verified scope and limits
++
++On macOS27.0.1/M2, the actual Windows fixture tests cover Unicode and spaces in
++cwd, quoted/literal arguments, filtered environment, launcher-child lifetime,
++duplicate refusal, two concurrent prefixes, TERM and memory-limit isolation,
++runtime migration/snapshot rollback, and failed initialization/retry. The
++modified upstream runtime-version tests also pass.
++
++Wine 0.3.0's bootstrap failed when builtin paths grew past its path buffer. A
++shorter support path ran the same executable successfully. The adapter currently
++requires its selected runtime root to be at most 180 shell characters, a
++conservative preflight rather than an upstream long-path fix. Deep workspaces
++should use a short private support directory. Long user Library paths must be
++checked by the future app as well.
++
++These tests do not establish game graphics, .NET9 launcher compatibility,
++authentication, game updates, clean-Mac execution without an installed Rosetta,
++or recovery from SIGKILL/OS restart. No Steam game launch was tested; only the
++existing runtime-management regression suite and standalone path were exercised.
+diff --git a/patches/fex/0006-JIT-Service-cooperative-suspension-on-conditional-back.patch b/patches/fex/0006-JIT-Service-cooperative-suspension-on-conditional-back.patch
+new file mode 100644
+index 0000000..8b86384
+--- /dev/null
++++ b/patches/fex/0006-JIT-Service-cooperative-suspension-on-conditional-back.patch
+@@ -0,0 +1,41 @@
++From 4aad77fbb57507c769775e707a564684d41f66dc Mon Sep 17 00:00:00 2001
++From: Alchemac downstream <noreply@alchemac.invalid>
++Date: Sat, 17 Oct 2026 22:03:35 +0900
++Subject: [PATCH] JIT: service cooperative suspension on conditional backedges
++
++Mirror the existing unconditional backedge interrupt check before
++emitting a conditional branch to an already-bound target. The check
++preserves NZCV, so both flag-based and register-based branches retain
++their original condition.
++
++A standalone dynamically generated x64 conditional loop hung in
++GetThreadContext with the original build; this change passes twenty
++suspend/context/resume cycles with the default MaxInst setting.
++
++Downstream only: AI-assisted work must not be submitted to FEX upstream.
++Assisted-by: LLM
++---
++ FEXCore/Source/Interface/Core/JIT/BranchOps.cpp | 7 +++++++
++ 1 file changed, 7 insertions(+)
++
++diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
++index c2b1d8e..219051e 100644
++--- a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+++++ b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
++@@ -250,6 +250,13 @@ DEF_OP(CondJump) {
++ 
++   auto TrueTargetLabel = JumpTarget(Op->TrueBlock);
++ 
+++  // Like a pending unconditional backedge, a conditional backedge can stay
+++  // inside this compiled block forever. Service cooperative suspension before
+++  // taking it. This check uses ldr/cbz and preserves the branch's NZCV flags.
+++  if (TrueTargetLabel->Backward.Location) {
+++    EmitSuspendInterruptCheck();
+++  }
+++
++   if (Op->FromNZCV) {
++     b_OrRestart(MapCC(Op->Cond), TrueTargetLabel);
++   } else {
++-- 
++2.54.0 (Apple Git-157)
++
+diff --git a/scripts/prefix-init.sh b/scripts/prefix-init.sh
+new file mode 100644
+index 0000000..6e6dad4
+--- /dev/null
++++ b/scripts/prefix-init.sh
+@@ -0,0 +1,74 @@
++# Generic ARM64 prefix initialization. Sourced by standalone-run with its lock held.
++# The Steam entry point keeps its original initialization until separately tested.
++prefix_machine() {
++    pe_offset=$(od -An -tu4 -j60 -N4 "$1" 2>/dev/null | tr -d ' ')
++    case "$pe_offset" in ''|*[!0-9]*) return 1 ;; esac
++    od -An -tx2 -j "$((pe_offset + 4))" -N2 "$1" 2>/dev/null | tr -d ' '
++}
++
++# FEX keys its disk cache on host features and configuration, not on its code
++# generator, so a new runtime would reuse code the previous FEX compiled. The
++# migration snapshot keeps the old cache for a rollback with the old runtime.
++# Only real directories inside the prefix are removed, never a linked host path.
++prefix_drop_fex_cache() {
++    for local in "$WINEPREFIX"/drive_c/users/*/AppData/Local; do
++        cache="$local/fex-emu/DiskCache"
++        [ -d "$cache" ] || continue
++        appdata=$(dirname "$local")
++        for part in "$(dirname "$appdata")" "$appdata" "$local" "$local/fex-emu" "$cache"; do
++            [ ! -L "$part" ] || { echo "standalone: linked FEX cache path left in place: $cache" >&2; continue 2; }
++        done
++        rm -rf "$cache" || return 1
++        echo "standalone: FEX code cache cleared for the new runtime"
++    done
++}
++
++prefix_prepare() {
++    id=$(runtime_id "$ROOT")
++    [ -n "$id" ] || { echo "standalone: runtime has no BUILD-ID" >&2; return 1; }
++    if [ -e "$WINEPREFIX" ]; then
++        [ -f "$WINEPREFIX/.hadron-prefix-ready" ] &&
++        [ "$(prefix_machine "$WINEPREFIX/drive_c/windows/system32/ntdll.dll")" = aa64 ] || {
++            echo "standalone: refusing an incomplete or foreign prefix: $WINEPREFIX" >&2
++            return 1
++        }
++        [ ! -f "$WINEPREFIX/.hadron-migration-incomplete" ] || {
++            echo "standalone: prefix migration incomplete; restore its recorded snapshot" >&2
++            return 1
++        }
++    else
++        stage="$WINEPREFIX.hadron-new.$$"
++        [ ! -e "$stage" ] || { echo "standalone: staging path already exists" >&2; return 1; }
++        # Let Wine create the disposable configuration directory itself.
++        printf '%s\n' "$stage" > "$HADRON_SCOPE_DIR/active-prefix"
++        echo "standalone: initializing a new ARM64 prefix"
++        if standalone_wine "$stage" "$ROOT/dist/bin/wine" wineboot --init &&
++           standalone_wine "$stage" "$ROOT/dist/bin/wineserver" -w &&
++           "$ROOT/scripts/mtld3d-prefix" enable "$stage" &&
++           [ "$(prefix_machine "$stage/drive_c/windows/system32/ntdll.dll")" = aa64 ]; then
++            printf '%s\n' "$id" > "$stage/.hadron-prefix-ready"
++            mv "$stage" "$WINEPREFIX" || return 1
++            stage=
++        else
++            standalone_wine "$stage" "$ROOT/dist/bin/wineserver" -k || true
++            echo "standalone: initialization failed; only its staging prefix will be removed" >&2
++            return 1
++        fi
++    fi
++    printf '%s\n' "$WINEPREFIX" > "$HADRON_SCOPE_DIR/active-prefix"
++    previous=$(cat "$WINEPREFIX/.hadron-prefix-ready")
++    if [ "$previous" != "$id" ]; then
++        backup="$WINEPREFIX.backup.$(date +%Y%m%d-%H%M%S).$$"
++        cp -c -R "$WINEPREFIX" "$backup" 2>/dev/null || {
++            [ ! -e "$backup" ] || { echo "standalone: partial snapshot at $backup" >&2; return 1; }
++            cp -R "$WINEPREFIX" "$backup" || return 1
++        }
++        printf '%s\n' "$backup" > "$WINEPREFIX/.hadron-migration-incomplete"
++        echo "standalone: prefix snapshot saved before runtime migration: $backup"
++        prefix_drop_fex_cache || return 1
++        standalone_wine "$WINEPREFIX" "$ROOT/dist/bin/wine" wineboot --update &&
++        standalone_wine "$WINEPREFIX" "$ROOT/dist/bin/wineserver" -w || return 1
++        printf '%s\n' "$id" > "$WINEPREFIX/.hadron-prefix-ready"
++        rm "$WINEPREFIX/.hadron-migration-incomplete"
++    fi
++}
+diff --git a/scripts/standalone-common.sh b/scripts/standalone-common.sh
+new file mode 100644
+index 0000000..d4eb06f
+--- /dev/null
++++ b/scripts/standalone-common.sh
+@@ -0,0 +1,40 @@
++# Shared scope checks for standalone-run, stop and the memory watchdog.
++# Every prefix has private APFS runtime copies. Their mapped paths identify its
++# processes without reading any process's environment or command-line secrets.
++standalone_scope_valid() {
++    [ -n "${WINEPREFIX:-}" ] && [ -n "${HADRON_SCOPE_DIR:-}" ] || return 1
++    [ -f "$HADRON_SCOPE_DIR/owner-prefix" ] || return 1
++    [ "$(cat "$HADRON_SCOPE_DIR/owner-prefix")" = "$WINEPREFIX" ] || return 1
++    case "$ROOT" in "$HADRON_SCOPE_DIR"/runtimes/*) ;; *) return 1 ;; esac
++    [ "$(dirname "$ROOT")" = "$HADRON_SCOPE_DIR/runtimes" ] || return 1
++    [ -f "$ROOT/BUILD-ID" ] && [ ! -L "$ROOT" ]
++}
++
++standalone_active_prefix() {
++    active="$WINEPREFIX"
++    if [ -f "$HADRON_SCOPE_DIR/active-prefix" ]; then
++        IFS= read -r active < "$HADRON_SCOPE_DIR/active-prefix" || return 1
++    fi
++    case "$active" in
++        "$WINEPREFIX") ;;
++        "$WINEPREFIX".hadron-new.*)
++            suffix=${active#"$WINEPREFIX".hadron-new.}
++            case "$suffix" in ''|*[!0-9]*) return 1 ;; esac ;;
++        *) return 1 ;;
++    esac
++    printf '%s\n' "$active"
++}
++
++# Only the prefix parameter changes between initialization and the real session.
++# UI runtimes and renderer settings are applied later by scripts/play.
++standalone_wine() {
++    target_prefix="$1"; shift
++    env -i HOME="$HOME" USER="$USER" LANG="${LANG:-en_US.UTF-8}" \
++        PATH=/usr/bin:/bin:/usr/sbin:/sbin TMPDIR="${TMPDIR:-/tmp}" \
++        WINEPREFIX="$target_prefix" WINEDEBUG=-all \
++        WINEDLLOVERRIDES="mscoree,mshtml=" \
++        DYLD_FALLBACK_LIBRARY_PATH="$ROOT/dist/ext/lib" FEX_DISKCACHE=0 \
++        "$@" 8>&- 9>&- &
++    wine_command_pid=$!
++    wait "$wine_command_pid"
++}
+diff --git a/scripts/standalone-run b/scripts/standalone-run
+new file mode 100755
+index 0000000..62c6c5b
+--- /dev/null
++++ b/scripts/standalone-run
+@@ -0,0 +1,123 @@
++#!/bin/sh
++# Non-Steam session supervisor. No game-specific code or Windows binary changes.
++# WINEPREFIX, HADRON_SUPPORT and HADRON_LOGS must be absolute explicit paths.
++# Usage: standalone-run <safe-id> <absolute-exe> [args...]
++ROOT=$(cd "$(dirname "$0")/.." && pwd -P) || exit 1
++[ $# -ge 2 ] || { echo "usage: $0 <safe-id> <absolute-exe> [args...]" >&2; exit 2; }
++case "$1" in ''|*[!A-Za-z0-9_-]*) echo "standalone: invalid id" >&2; exit 2 ;; esac
++case "$2" in /*) ;; *) echo "standalone: EXE must be an absolute path" >&2; exit 2 ;; esac
++[ -f "$2" ] || { echo "standalone: EXE not found" >&2; exit 2; }
++
++# Do not inherit host tokens, Steam state, DYLD injection or unrelated Wine vars.
++if [ "${HADRON_STANDALONE_ENV_READY:-0}" != 1 ]; then
++    set -- /bin/sh "$ROOT/scripts/standalone-run" "$@"
++    for name in WINEPREFIX WINEDEBUG WINEDLLOVERRIDES HADRON_SUPPORT HADRON_LOGS \
++        HADRON_WORKDIR HADRON_APP_NAME HADRON_LOG HADRON_MEM_LIMIT_GB \
++        HADRON_SWAP_LIMIT_MB HADRON_DISK_MIN_GB HADRON_VSYNC HADRON_D3D9 \
++        HADRON_D3D12 HADRON_PRECISE_SCROLLING HADRON_HARDWARE_TSO \
++        HADRON_LARGE_ADDRESS_AWARE DXMT_CONFIG MTLD3D_CONFIG \
++        FEX_DISKCACHE FEX_BLOCKJITNAMING MTL_HUD_ENABLED DOTNET_BUNDLE_EXTRACT_BASE_DIR LC_ALL; do
++        if value=$(printenv "$name"); then set -- "$name=$value" "$@"; fi
++    done
++    exec env -i HOME="$HOME" USER="$USER" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
++        TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-en_US.UTF-8}" \
++        HADRON_STANDALONE_ENV_READY=1 "$@"
++fi
++
++for path in "${WINEPREFIX:-}" "${HADRON_SUPPORT:-}" "${HADRON_LOGS:-}"; do
++    case "$path" in /*) ;; *) echo "standalone: explicit absolute prefix/support/log paths required" >&2; exit 2 ;; esac
++    case "$path" in /|"$HOME"|*'
++'*) echo "standalone: unsafe path" >&2; exit 2 ;; esac
++done
++[ ! -L "$WINEPREFIX" ] || { echo "standalone: prefix symlinks are not accepted" >&2; exit 2; }
++mkdir -p "$(dirname "$WINEPREFIX")" "$HADRON_SUPPORT" "$HADRON_LOGS" || exit 1
++WINEPREFIX="$(cd "$(dirname "$WINEPREFIX")" && pwd -P)/$(basename "$WINEPREFIX")"
++case "$(basename "$WINEPREFIX")" in .|..) echo "standalone: unsafe prefix name" >&2; exit 2 ;; esac
++BASE=${HADRON_STANDALONE_BASE_SUPPORT:-$HADRON_SUPPORT}
++BASE=$(cd "$BASE" && pwd -P) || exit 1
++case "$BASE/" in "$WINEPREFIX/"*) echo "standalone: support must be outside the prefix" >&2; exit 2 ;; esac
++key=$(printf '%s' "$WINEPREFIX" | /sbin/md5 -q)
++HADRON_SCOPE_DIR="$BASE/prefix-sessions/$key"
++HADRON_SUPPORT="$HADRON_SCOPE_DIR"
++mkdir -p "$HADRON_SCOPE_DIR" || exit 1
++if [ -e "$HADRON_SCOPE_DIR/owner-prefix" ]; then
++    [ "$(cat "$HADRON_SCOPE_DIR/owner-prefix")" = "$WINEPREFIX" ] || exit 1
++else
++    printf '%s\n' "$WINEPREFIX" > "$HADRON_SCOPE_DIR/owner-prefix"
++fi
++export WINEPREFIX HADRON_SUPPORT HADRON_LOGS HADRON_SCOPE_DIR
++export HADRON_STANDALONE_BASE_SUPPORT="$BASE"
++export HADRON_PROCESS_SCOPE=prefix HADRON_RUNTIME_ENTRYPOINT=standalone-run
++
++# A sibling lock survives prefix creation/rename, and is shared across support roots.
++if [ "${HADRON_STANDALONE_LOCK_PID:-}" != "$$" ]; then
++    lock="$(dirname "$WINEPREFIX")/.$(basename "$WINEPREFIX").hadron-session.lock"
++    [ ! -L "$lock" ] || exit 2
++    exec 8>>"$lock" || exit 1
++    if ! lockf -s -t 0 8; then echo "standalone: session already running" >&2; exit 75; fi
++    export HADRON_STANDALONE_LOCK_PID=$$
++fi
++
++. "$ROOT/scripts/paths.sh"
++. "$ROOT/scripts/runtime-versions.sh"
++runtime_lock || { echo "standalone: runtime selection lock failed" >&2; exit 1; }
++chosen=$(runtime_of_session)
++if [ -z "$chosen" ]; then
++    case "$ROOT" in
++        "$HADRON_RUNTIMES"/*) source=$(runtime_source) ;;
++        *) source="$ROOT" ;;
++    esac
++    chosen=$(runtime_copy "$source") || { runtime_unlock; exit 1; }
++    runtime_point "$chosen" || { runtime_unlock; exit 1; }
++    printf '%s\n' "$source" > "$HADRON_SUPPORT/source"
++fi
++runtime_unlock
++if [ "$chosen" != "$ROOT" ]; then
++    [ -x "$chosen/scripts/standalone-run" ] || { echo "standalone: selected runtime has no entry point" >&2; exit 1; }
++    exec "$chosen/scripts/standalone-run" "$@"
++fi
++. "$ROOT/scripts/standalone-common.sh"
++standalone_scope_valid || { echo "standalone: scope mismatch" >&2; exit 1; }
++# Wine 0.3.0's bootstrap can truncate builtin DLL paths near MAX_PATH. Refuse
++# deep support roots before touching a prefix; the default user Library path is
++# short enough. This conservative bound also leaves room for bootstrap helpers.
++[ "${#ROOT}" -le 180 ] || {
++    echo "standalone: runtime path too long for Wine bootstrap; use a shorter HADRON_SUPPORT" >&2
++    exit 2
++}
++# Orphaned Wine in a prefix must be stopped rather than implicitly joined.
++[ -z "$(runtime_of_session)" ] || { echo "standalone: existing unmanaged Wine session; stop it first" >&2; exit 75; }
++runtime_mark "$ROOT"
++stage= watcher=
++cleanup() {
++    status=$?
++    trap - EXIT TERM INT HUP
++    if [ -n "$watcher" ]; then kill "$watcher" 2>/dev/null; wait "$watcher" 2>/dev/null; fi
++    if [ "$status" -ne 0 ]; then "$ROOT/scripts/stop" >/dev/null 2>&1; fi
++    if [ -n "$stage" ] && [ "$stage" = "$WINEPREFIX.hadron-new.$$" ]; then rm -rf "$stage"; fi
++    runtime_unmark "$ROOT"
++    rm -f "$HADRON_SCOPE_DIR/active-prefix"
++    exec 8>&-
++    exit "$status"
++}
++trap cleanup EXIT
++trap '"$ROOT/scripts/stop"; exit 143' TERM INT HUP
++rm -f "$HADRON_SCOPE_DIR/stop-request"
++printf '%s\n' "$WINEPREFIX" > "$HADRON_SCOPE_DIR/active-prefix"
++log="$HADRON_LOGS/$1-$$.session.log"
++exec >>"$log" 2>&1
++echo "standalone: runtime $(runtime_id "$ROOT"); session=$$"
++printf '%s\n' "$$" > "$HADRON_SCOPE_DIR/supervisor-pid"
++# Always exactly one watchdog, attached to the supervisor, including initialization.
++"$ROOT/scripts/watchdog" "$HADRON_LOGS/$1-$$.mem.log" "$$" 8>&- &
++watcher=$!
++. "$ROOT/scripts/prefix-init.sh"
++prefix_prepare || exit 1
++export HADRON_STANDALONE=1 HADRON_WATCHDOG=0
++"$ROOT/scripts/play" "$@" 8>&- &
++child=$!
++wait "$child"; first_status=$?
++echo "standalone: initial process exit=$first_status; waiting for the whole Wine session"
++standalone_wine "$WINEPREFIX" "$ROOT/dist/bin/wineserver" -w || exit 1
++[ ! -f "$HADRON_SCOPE_DIR/stop-request" ] || exit 143
++exit "$first_status"
+diff --git a/tests/mac/test-standalone-failure.py b/tests/mac/test-standalone-failure.py
+new file mode 100644
+index 0000000..ae7bed2
+--- /dev/null
++++ b/tests/mac/test-standalone-failure.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++"""Initialization failure/retry and foreign-prefix protection regression checks."""
++import argparse
++import json
++import os
++from pathlib import Path
++import shutil
++import struct
++import subprocess
++
++parser = argparse.ArgumentParser()
++for flag in ('runtime', 'fixture', 'state', 'out'):
++    parser.add_argument('--' + flag, required=True, type=Path)
++args = parser.parse_args()
++runtime, fixture, state, out = (p.resolve() for p in (args.runtime, args.fixture, args.state, args.out))
++assert not state.exists()
++state.mkdir(parents=True)
++out.mkdir(parents=True, exist_ok=True)
++results = []
++
++
++def check(name, condition):
++    results.append({'test': name, 'passed': bool(condition)})
++    (out / 'results.json').write_text(json.dumps(results, indent=2))
++    print(('ok   ' if condition else 'FAIL ') + name, flush=True)
++    if not condition:
++        raise AssertionError(name)
++
++
++def run(rt, prefix, support=None):
++    env = {k: os.environ[k] for k in ('HOME', 'USER', 'TMPDIR') if k in os.environ}
++    env.update(PATH='/usr/bin:/bin:/usr/sbin:/sbin', LANG='en_US.UTF-8',
++               WINEPREFIX=str(prefix), HADRON_SUPPORT=str(support or state / 'support'),
++               HADRON_LOGS=str(out / prefix.name), FEX_DISKCACHE='0')
++    with (out / (prefix.name + '-' + rt.name + '.outer.log')).open('w') as log:
++        p = subprocess.Popen([str(rt / 'scripts/standalone-run'), 'failure-test', str(fixture), 'exit', '0'],
++                             env=env, stdout=log, stderr=subprocess.STDOUT)
++        try:
++            return p.wait(timeout=80)
++        except BaseException:
++            p.terminate()
++            p.wait(timeout=20)
++            raise
++
++
++# This is an entirely synthetic shell runtime, not a modified signed Wine loader.
++mock = state / 'mock-init-fail'
++(mock / 'dist/bin').mkdir(parents=True)
++shutil.copytree(runtime / 'scripts', mock / 'scripts', symlinks=True)
++(mock / 'BUILD-ID').write_text('mock-init-fail\n')
++(mock / 'dist/bin/wine').write_text('#!/bin/sh\nmkdir -p "$WINEPREFIX"\necho partial > "$WINEPREFIX/test-partial"\nexit 1\n')
++(mock / 'dist/bin/wineserver').write_text('#!/bin/sh\nexit 0\n')
++for name in ('wine', 'wineserver'):
++    (mock / 'dist/bin' / name).chmod(0o755)
++target = state / 'retry-prefix'
++check('injected initialization failure returns nonzero', run(mock, target) != 0)
++check('failed initialization never installs an incomplete prefix', not target.exists())
++check('only disposable staging data is removed', not list(state.glob('retry-prefix.hadron-new.*')))
++check('real runtime can retry same path successfully', run(runtime, target) == 0)
++check('successful retry has ARM64 ready marker', (target / '.hadron-prefix-ready').is_file())
++
++foreign = state / 'foreign-prefix'
++system32 = foreign / 'drive_c/windows/system32'
++system32.mkdir(parents=True)
++data = bytearray(128)
++data[:2] = b'MZ'
++struct.pack_into('<I', data, 60, 64)
++data[64:68] = b'PE\0\0'
++struct.pack_into('<H', data, 68, 0x8664)
++(system32 / 'ntdll.dll').write_bytes(data)
++(foreign / '.hadron-prefix-ready').write_text('foreign\n')
++(foreign / 'keep.txt').write_text('do not touch')
++check('x64 foreign prefix is explicitly refused', run(runtime, foreign) != 0)
++check('foreign DLL and data remain unchanged', (system32 / 'ntdll.dll').read_bytes() == bytes(data) and (foreign / 'keep.txt').read_text() == 'do not touch')
++
++long_prefix = state / 'long-path-prefix'
++check('deep runtime path is rejected before Wine bootstrap', run(runtime, long_prefix, state / ('deep-' + 'x' * 100)) == 2)
++check('path rejection does not create a prefix', not long_prefix.exists())
++print('all standalone failure/retry checks passed', flush=True)
+diff --git a/tests/mac/test-standalone.py b/tests/mac/test-standalone.py
+new file mode 100644
+index 0000000..3df316c
+--- /dev/null
++++ b/tests/mac/test-standalone.py
+@@ -0,0 +1,222 @@
++#!/usr/bin/env python3
++"""Real Wine integration tests; explicit disposable runtime/prefix/fixture only."""
++import argparse
++import hashlib
++import json
++import os
++from pathlib import Path
++import shutil
++import signal
++import subprocess
++import time
++
++parser = argparse.ArgumentParser()
++parser.add_argument('--runtime', type=Path, required=True)
++parser.add_argument('--fixture', type=Path, required=True)
++parser.add_argument('--seed-prefix', type=Path, required=True)
++parser.add_argument('--state', type=Path, required=True)
++parser.add_argument('--out', type=Path, required=True)
++args = parser.parse_args()
++runtime, fixture, state, out = (p.resolve() for p in (args.runtime, args.fixture, args.state, args.out))
++assert not state.exists(), 'Use a fresh disposable state directory for each run'
++state.mkdir(parents=True)
++out.mkdir(parents=True, exist_ok=True)
++support = state / 'support'
++processes = []
++results = []
++
++
++def check(name, condition):
++    results.append({'test': name, 'passed': bool(condition)})
++    (out / 'results.json').write_text(json.dumps(results, indent=2))
++    print(('ok   ' if condition else 'FAIL ') + name, flush=True)
++    if not condition:
++        raise AssertionError(name)
++
++
++def until(predicate, seconds=20):
++    deadline = time.monotonic() + seconds
++    while time.monotonic() < deadline:
++        if predicate():
++            return True
++        time.sleep(.2)
++    return False
++
++
++def clone(source, dest):
++    subprocess.run(['/bin/cp', '-c', '-R', str(source), str(dest)], check=True)
++
++
++def prefix(name):
++    path = state / name
++    clone(args.seed_prefix.resolve(), path)
++    return path
++
++
++def scope(path):
++    key = hashlib.md5(str(path).encode()).hexdigest()
++    return support / 'prefix-sessions' / key
++
++
++def current_runtime(path):
++    return (scope(path) / 'runtime').resolve()
++
++
++def environment(path, **extra):
++    env = {k: os.environ[k] for k in ('HOME', 'USER', 'TMPDIR') if k in os.environ}
++    env.update(PATH='/usr/bin:/bin:/usr/sbin:/sbin', LANG='en_US.UTF-8',
++               WINEPREFIX=str(path), HADRON_SUPPORT=str(support), HADRON_LOGS=str(out / path.name),
++               PRIVATE_TEST_TOKEN='fixture-dummy-value', SteamAppId='not-a-steam-app',
++               STEAM_COMPAT_DATA_PATH='/nonexistent-steam-library',
++               STEAM_COMPAT_CLIENT_INSTALL_PATH='/nonexistent-steam-client',
++               STEAM_DYLD_INSERT_LIBRARIES='/nonexistent-overlay', FEX_DISKCACHE='0',
++               WINEDEBUG='-all,+loaddll')
++    env.update(extra)
++    return env
++
++
++def start(path, mode, marker='unused', ms='0', *, rt=runtime, cwd=None, more=()):
++    env = environment(path, **({'HADRON_WORKDIR': str(cwd)} if cwd else {}))
++    dest = out / (path.name + '-' + str(len(processes)) + '.outer.log')
++    with dest.open('w') as log:
++        p = subprocess.Popen([str(rt / 'scripts/standalone-run'), 'fixture', str(fixture),
++                              mode, str(marker), str(ms), *more], env=env,
++                             stdout=log, stderr=subprocess.STDOUT)
++    processes.append(p)
++    return p
++
++
++def session_text(path):
++    return '\n'.join(p.read_text(errors='replace') for p in (out / path.name).glob('*.session.log'))
++
++
++def memory_text(path):
++    return '\n'.join(p.read_text(errors='replace') for p in (out / path.name).glob('*.mem.log'))
++
++
++def beat(path):
++    try:
++        return path.read_text()
++    except FileNotFoundError:
++        return ''
++
++
++def stop(p):
++    p.send_signal(signal.SIGTERM)
++    return p.wait(timeout=20)
++
++
++def scoped_env(path):
++    return dict(environment(path), HADRON_SCOPE_DIR=str(scope(path)), HADRON_PROCESS_SCOPE='prefix')
++
++
++try:
++    a, b = prefix('prefix-a'), prefix('prefix-b')
++    cwd = state / 'working space 한글'
++    cwd.mkdir()
++    marker = cwd / 'ready 한글.txt'
++    literal = '$(touch SHOULD_NOT_EXIST)'
++    p = start(a, 'wait', marker.name, '1800', cwd=cwd, more=('a "quoted" value', literal))
++    check('spaces and Unicode working directory executes', until(marker.exists, 60))
++    check('normal standalone session returns exit 0', p.wait(timeout=25) == 0)
++    text = session_text(a)
++    check('quoted and shell-like arguments preserved literally', 'arg4=a "quoted" value' in text and 'arg5=' + literal in text)
++    check('no shell injection', not (cwd / 'SHOULD_NOT_EXIST').exists())
++    check('Steam and host secret variables removed', '=PRESENT' not in text and text.count('=absent') >= 7)
++    check('custom working directory reaches Windows', str(cwd).replace('/', '\\') in beat(marker))
++    check('watchdog starts and records this session', 'procs=' in memory_text(a))
++    check('Steam bridge not staged into prefix', not (a / 'drive_c/Program Files (x86)/Steam/steam.exe').exists())
++    check('no hadron-steam execution or lsteamclient module', 'hadron-steam.exe' not in text and 'lsteamclient.dll' not in text)
++
++    marker_a, marker_b = state / 'a.txt', state / 'b.txt'
++    pa = start(a, 'spawn', marker_a, '120000')
++    parent_log = out / a.name / ('fixture-' + str(pa.pid) + '.session.log')
++    check('launcher can start a child and exit', until(lambda: marker_a.exists() and parent_log.exists() and 'initial process exit=0' in parent_log.read_text(), 60))
++    check('supervisor stays for the child', pa.poll() is None)
++    pb = start(b, 'wait', marker_b, '150000')
++    check('second prefix starts concurrently', until(marker_b.exists, 60))
++    check('two prefixes use different mapped runtime directories', current_runtime(a) != current_runtime(b))
++    check('watchdog still runs after initial launcher exits', until(lambda: 'procs=' in memory_text(a)))
++    before = beat(marker_a)
++    duplicate = subprocess.run([str(runtime / 'scripts/standalone-run'), 'fixture', str(fixture), 'exit', '0'],
++                               env=environment(a), capture_output=True, text=True, timeout=10)
++    check('same-prefix duplicate refused with exit 75', duplicate.returncode == 75 and 'already running' in duplicate.stderr)
++    check('refusing duplicate does not stop original child', until(lambda: beat(marker_a) != before))
++    before_b = beat(marker_b)
++    check('TERM stops only first prefix with exit 143', stop(pa) == 143)
++    check('second prefix continues after first is stopped', pb.poll() is None and until(lambda: beat(marker_b) != before_b))
++    check('stopped prefix heartbeat no longer changes', (lambda value: (time.sleep(.8), beat(marker_a) == value)[1])(beat(marker_a)))
++
++    pa = start(a, 'wait', marker_a, '45000')
++    old = beat(marker_a)
++    check('stopped prefix can restart', until(lambda: beat(marker_a) != old))
++    wrong = scoped_env(b)
++    wrong['HADRON_SCOPE_DIR'] = str(scope(a))
++    refused = subprocess.run([str(current_runtime(a) / 'scripts/stop')], env=wrong,
++                             capture_output=True, text=True, timeout=10)
++    check('mismatched prefix scope refuses termination', refused.returncode == 2 and pa.poll() is None and pb.poll() is None)
++    threshold_env = dict(scoped_env(a), HADRON_MEM_LIMIT_GB='0')
++    wd = subprocess.Popen([str(current_runtime(a) / 'scripts/watchdog'), str(out / 'threshold.mem.log'), str(pa.pid)],
++                          env=threshold_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    check('watchdog memory cap causes a real scoped stop', wd.wait(timeout=20) == 1 and pa.wait(timeout=20) == 143)
++    before_b = beat(marker_b)
++    check('other prefix survives watchdog action', pb.poll() is None and until(lambda: beat(marker_b) != before_b))
++    check('second prefix stops cleanly', stop(pb) == 143)
++
++    # An actual new adapter build with unchanged Wine binaries exercises prefix
++    # snapshots and build pinning, without updating the game or live code.
++    newer = state / 'updated-runtime'
++    clone(runtime, newer)
++    next_id = (runtime / 'BUILD-ID').read_text().strip() + '-next'
++    (newer / 'BUILD-ID').write_text(next_id + '\n')
++    marker_a.unlink(missing_ok=True)
++    pa = start(a, 'wait', marker_a, '6500')
++    check('old runtime session starts before update', until(marker_a.exists))
++    old_runtime = current_runtime(a)
++    dup = subprocess.run([str(newer / 'scripts/standalone-run'), 'fixture', str(fixture), 'exit', '0'],
++                         env=environment(a), capture_output=True, text=True, timeout=10)
++    check('updated source cannot replace active prefix runtime', dup.returncode == 75 and current_runtime(a) == old_runtime)
++    check('active old session finishes normally', pa.wait(timeout=25) == 0)
++    (a / 'user-data.txt').write_text('keep-me')
++    fex_cache = a / 'drive_c/users' / os.environ['USER'] / 'AppData/Local/fex-emu/DiskCache'
++    (fex_cache / 'bucket').mkdir(parents=True, exist_ok=True)
++    (fex_cache / 'bucket/RWCacheDB_old.foz').write_text('compiled by the old runtime')
++    p = start(a, 'exit', '0', rt=newer)
++    check('new build starts after idle prefix migration', p.wait(timeout=65) == 0)
++    check('new runtime selected and prefix version recorded', current_runtime(a) != old_runtime and (a / '.hadron-prefix-ready').read_text().strip() == next_id)
++    backups = sorted(state.glob('prefix-a.backup.*'))
++    check('migration snapshot and user data preserved', bool(backups) and (a / 'user-data.txt').read_text() == 'keep-me')
++    snapshot_cache = backups[-1] / fex_cache.relative_to(a) / 'bucket/RWCacheDB_old.foz'
++    check('migration drops the old FEX code cache and keeps it in the snapshot',
++          not (fex_cache / 'bucket/RWCacheDB_old.foz').exists() and snapshot_cache.exists())
++    # Restore the snapshot as well as the matching runtime for rollback.
++    a.rename(state / 'prefix-a.after-migration')
++    clone(backups[-1], a)
++    p = start(a, 'exit', '0')
++    check('snapshot plus matching old runtime can roll back', p.wait(timeout=30) == 0 and current_runtime(a) == old_runtime)
++    check('restored user data preserved', (a / 'user-data.txt').read_text() == 'keep-me')
++
++    for label, argv, expected in [
++        ('unsafe id rejected', ['../bad', str(fixture)], 2),
++        ('relative EXE rejected', ['fixture', 'relative.exe'], 2),
++    ]:
++        proc = subprocess.run([str(runtime / 'scripts/standalone-run'), *argv], env=environment(a), capture_output=True, timeout=10)
++        check(label, proc.returncode == expected)
++    foreign = state / 'foreign'
++    foreign.mkdir()
++    (foreign / 'keep.txt').write_text('must-not-delete')
++    p = start(foreign, 'exit', '0')
++    check('foreign or incomplete prefix refused', p.wait(timeout=20) != 0)
++    check('foreign data never deleted', (foreign / 'keep.txt').read_text() == 'must-not-delete')
++
++    print('all standalone integration checks passed', flush=True)
++finally:
++    for p in processes:
++        if p.poll() is None:
++            p.terminate()
++            try:
++                p.wait(timeout=20)
++            except subprocess.TimeoutExpired:
++                # Leave the precise scope and PID evidence; never global-kill Wine.
++                print('cleanup needs attention for supervisor', p.pid, flush=True)
++    (out / 'results.json').write_text(json.dumps(results, indent=2))
+diff --git a/tests/win/standalone.c b/tests/win/standalone.c
+new file mode 100644
+index 0000000..150a72d
+--- /dev/null
++++ b/tests/win/standalone.c
+@@ -0,0 +1,58 @@
++/* Standalone session regression fixture. Never reads real account data. */
++#define _WIN32_WINNT 0x0A00
++#include <windows.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <wchar.h>
++
++static void text(FILE *out, const wchar_t *value)
++{
++    char utf8[32768];
++    WideCharToMultiByte(CP_UTF8, 0, value, -1, utf8, sizeof(utf8), NULL, NULL);
++    fputs(utf8, out);
++}
++
++int wmain(int argc, wchar_t **argv)
++{
++    wchar_t cwd[32768], exe[32768], cmd[32768];
++    const wchar_t *blocked[] = {L"PRIVATE_TEST_TOKEN", L"SteamAppId", L"SteamGameId",
++        L"STEAM_COMPAT_DATA_PATH", L"STEAM_COMPAT_CLIENT_INSTALL_PATH",
++        L"STEAM_DYLD_INSERT_LIBRARIES", L"DYLD_INSERT_LIBRARIES"};
++    GetCurrentDirectoryW(32768, cwd);
++    printf("pid=%lu\ncwd=", GetCurrentProcessId()); text(stdout, cwd); putchar('\n');
++    for (int i = 0; i < argc; i++) {
++        printf("arg%d=", i); text(stdout, argv[i]); putchar('\n');
++    }
++    for (unsigned i = 0; i < sizeof(blocked) / sizeof(blocked[0]); i++) {
++        fputs("env:", stdout); text(stdout, blocked[i]);
++        printf("=%s\n", GetEnvironmentVariableW(blocked[i], NULL, 0) ? "PRESENT" : "absent");
++    }
++    fflush(stdout);
++    if (argc < 2) return 2;
++    if (!wcscmp(argv[1], L"exit")) return argc > 2 ? _wtoi(argv[2]) : 0;
++    if (argc < 4) return 2;
++    if (!wcscmp(argv[1], L"spawn")) {
++        STARTUPINFOW si = {sizeof(si)};
++        PROCESS_INFORMATION pi;
++        GetModuleFileNameW(NULL, exe, 32768);
++        swprintf(cmd, 32768, L"\"%ls\" wait \"%ls\" %ls", exe, argv[2], argv[3]);
++        if (!CreateProcessW(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
++            printf("CreateProcess failed %lu\n", GetLastError()); return 3;
++        }
++        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
++        puts("parent exiting while child is alive");
++        return 0;
++    }
++    if (wcscmp(argv[1], L"wait")) return 2;
++    DWORD duration = wcstoul(argv[3], NULL, 10), start = GetTickCount();
++    unsigned beat = 0;
++    do {
++        FILE *out = _wfopen(argv[2], L"wb");
++        if (!out) return 4;
++        fprintf(out, "pid=%lu\nbeat=%u\ncwd=", GetCurrentProcessId(), beat++);
++        text(out, cwd); fputs("\n", out); fclose(out);
++        Sleep(200);
++    } while (GetTickCount() - start < duration);
++    puts("fixture completed");
++    return 0;
++}
