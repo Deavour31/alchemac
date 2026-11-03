@@ -16,7 +16,9 @@ RUNTIME = next((d for d in (ROOT / 'work/hadron-prototype' / b / PROFILE['runtim
 if RUNTIME is None: raise SystemExit('Runtime build not found: ' + PROFILE['runtime_build_id'])
 RELEASE = '--release' in sys.argv[1:]
 BUNDLE_ID = 'io.github.deavour31.alchemac'
-VERSION, BUILD = '0.5.1', '22'
+VERSION, BUILD = '0.5.4', '25'
+# https://dl.winehq.org/wine/wine-mono/11.3.0/wine-mono-11.3.0-x86.msi, the version this Wine asks for.
+WINE_MONO_SHA256 = 'df2dfc1665c2511882e7cabd56eafd0c0a3d94e5a7e86f969277f6c189d418d3'
 PARENT = ROOT / ('outputs/alchemac-release.noindex' if RELEASE else 'outputs/alchemac-app-build.noindex')
 APP = PARENT / 'Alchemac.app'
 STAGE = PARENT / ('.staging-' + str(os.getpid())) / APP.name
@@ -65,14 +67,24 @@ def main():
     shutil.copy2(ROOT / 'src/hadron/sources.conf', resources / 'hadron-sources.conf')
     shutil.copy2(ROOT / 'outputs/hadron-investigation/runs/T2/standalone.patch', resources / 'standalone.patch')
     shutil.copy2(ROOT / 'app/alchemac/README.md', resources / 'README.md')
+    shutil.copy2(ROOT / 'app/alchemac/session-attach', resources / 'session-attach')
+    # prefix-profile installs this into a prefix the first time a .NET Framework program runs there.
+    mono = ROOT / 'work/wine-mono/wine-mono-11.3.0-x86.msi'
+    if sha(mono) != WINE_MONO_SHA256:
+        raise SystemExit('Wine Mono package does not match the pinned hash')
+    shutil.copy2(mono, resources / 'wine-mono.msi')
     licenses = resources / 'Licenses'
     licenses.mkdir()
     shutil.copy2(ROOT / 'app/alchemac/LICENSE', licenses / 'Alchemac-LICENSE.txt')
     shutil.copy2(ROOT / 'work/NanumGothic-OFL.txt', licenses / 'NanumGothic-OFL.txt')
+    shutil.copy2(ROOT / 'work/wine-mono/COPYING', licenses / 'Wine-Mono-COPYING.txt')
     (licenses / 'README.txt').write_text(
         'Alchemac is MIT licensed (Alchemac-LICENSE.txt).\n'
         'It bundles the Hadron runtime (BSD-3-Clause, Copyright (c) 2026 David Andrews) with Wine, FEX,\n'
         'DXMT and other components, each under its own license in components/.\n'
+        'It also bundles Wine Mono 11.3.0 (https://github.com/wine-mono/wine-mono), installed into a\n'
+        'Wine environment when a .NET Framework program first runs there; source and license:\n'
+        'https://dl.winehq.org/wine/wine-mono/11.3.0/\n'
         'Alchemac changes to Hadron and FEX are published as patches with the Alchemac source:\n'
         'https://github.com/Deavour31/alchemac\n', encoding='utf-8')
     run(['/bin/cp', '-R', contents / 'SharedSupport/runtime/licenses', licenses / 'components'])

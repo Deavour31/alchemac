@@ -29,7 +29,7 @@ FILES = {
     'tools/app/request-close.swift': 'tools/app/request-close.swift',
 }
 APP_SOURCES = ['main.swift', 'App.swift', 'Runtime.swift', 'SessionController.swift', 'Profile.swift',
-               'InputSource.swift', 'Addon.swift', 'prefix-profile.c', 'README.md', 'LICENSE']
+               'InputSource.swift', 'Addon.swift', 'prefix-profile.c', 'session-attach', 'README.md', 'LICENSE']
 
 HADRON_README = f"""# Hadron changes
 

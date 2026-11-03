@@ -28,6 +28,8 @@ final class SessionController: ObservableObject {
     /// Runs when the last session has ended.
     var finished: (() -> Void)?
     private let runtime: URL
+    /// `session-attach` processes still starting their program.
+    private var attached: [Process] = []
 
     init(runtime: URL = AlchemacRuntime.root) { self.runtime = runtime }
 
@@ -51,6 +53,38 @@ final class SessionController: ObservableObject {
                   running: "\(setup.lastPathComponent) 설치 중 · \(place)에 설치합니다. 설치가 끝나면 새 프로그램 등록을 안내합니다.", then: then) {
             try AlchemacRuntime.configureInstaller($0, setup: setup, environment: environment, store: store, runtime: self.runtime)
         }
+    }
+
+    /// Runs another EXE in a registered program's Wine environment, marked as that program's session.
+    func runTool(_ tool: URL, for launcher: Launcher, store: LauncherStore, then: @escaping () -> Void) throws {
+        try start(id: launcher.id, title: tool.lastPathComponent,
+                  running: "\(tool.lastPathComponent) 실행 중 · ‘\(launcher.name)’의 Wine 환경", then: then) {
+            try AlchemacRuntime.configureTool($0, tool: tool, for: launcher, store: store, runtime: self.runtime)
+        }
+    }
+
+    /// Starts another EXE inside the running session of that program's prefix. The supervisor
+    /// already owns the session, so this short-lived process is not a session of its own.
+    func attachTool(_ tool: URL, for launcher: Launcher, store: LauncherStore) throws {
+        let next = Process()
+        try AlchemacRuntime.configureAttachedTool(next, tool: tool, for: launcher, store: store, runtime: runtime)
+        let name = tool.lastPathComponent
+        next.standardOutput = FileHandle.nullDevice
+        next.standardError = FileHandle.nullDevice
+        next.terminationHandler = { [weak self] child in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.attached.removeAll { $0 === child }
+                if child.terminationStatus == 75 {
+                    self.message = "\(name): 실행 중인 세션에 합류하지 못했습니다. 프로그램 창이 뜬 뒤 다시 시도해 주세요."
+                } else if child.terminationStatus != 0 {
+                    self.message = "\(name): 실행하지 못했습니다 (코드 \(child.terminationStatus)). 진단 로그를 확인해 주세요."
+                }
+            }
+        }
+        try next.run()
+        attached.append(next)
+        message = "\(name) 실행 중 · ‘\(launcher.name)’ 세션에 합류했습니다."
     }
 
     /// Imports a .reg file into an environment; `then` runs after the Wine session ends.

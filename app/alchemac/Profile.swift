@@ -55,6 +55,23 @@ struct Launcher: Codable, Identifiable, Hashable {
     }
 }
 
+extension LauncherStore {
+    /// Whether this EXE is a .NET Framework program and the prefix does not have Wine Mono yet,
+    /// so its first start takes extra time. prefix-profile makes the same check and installs it.
+    func needsWineMono(_ exe: URL, in prefix: URL) -> Bool {
+        guard !fm.fileExists(atPath: prefix.appendingPathComponent("drive_c/windows/mono/mono-2.0/bin/libmono-2.0-x86_64.dll").path),
+              let file = try? FileHandle(forReadingFrom: exe), let head = try? file.read(upToCount: 4096), head.count >= 0x40 else { return false }
+        defer { try? file.close() }
+        func u16(_ at: Int) -> Int { at + 2 <= head.count ? Int(head[at]) | Int(head[at + 1]) << 8 : 0 }
+        func u32(_ at: Int) -> Int { at + 4 <= head.count ? u16(at) | u16(at + 2) << 16 : 0 }
+        let pe = u32(0x3c)
+        guard u16(0) == 0x5a4d, u32(pe) == 0x4550 else { return false }
+        let optional = pe + 24, magic = u16(optional)
+        guard magic == 0x10b || magic == 0x20b else { return false }
+        return u32(optional + (magic == 0x20b ? 112 : 96) + 14 * 8) != 0
+    }
+}
+
 extension Launcher {
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)

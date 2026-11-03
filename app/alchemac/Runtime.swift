@@ -52,6 +52,30 @@ enum AlchemacRuntime {
                     store: store, runtime: runtime, resources: resources)
     }
 
+    /// Runs another EXE, such as a patch or a tool for the program, in that program's Wine environment.
+    static func configureTool(_ process: Process, tool: URL, for launcher: Launcher, store: LauncherStore, runtime: URL = root, resources: URL? = nil) throws {
+        let file = tool.standardizedFileURL
+        guard file.pathExtension.lowercased() == "exe", !file.path.contains("\""),
+              FileManager.default.fileExists(atPath: file.path) else {
+            throw AlchemacError.message("실행할 Windows 프로그램(.exe)을 선택해 주세요.")
+        }
+        try prepare(process, session: "alchemac-" + launcher.id, target: windows(file), workdir: file.deletingLastPathComponent(),
+                    prefix: try store.prefix(launcher), logs: launcher.id,
+                    settings: launcher.addon.flatMap(store.addon)?.launchEnvironment ?? [:], mode: "--setup",
+                    store: store, runtime: runtime, resources: resources)
+    }
+
+    /// Runs another EXE inside the program's running session, which `session-attach` joins.
+    static func configureAttachedTool(_ process: Process, tool: URL, for launcher: Launcher, store: LauncherStore, runtime: URL = root, resources: URL? = nil) throws {
+        try configureTool(process, tool: tool, for: launcher, store: store, runtime: runtime, resources: resources)
+        let assets = resources ?? runtime.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Resources")
+        let script = assets.appendingPathComponent("session-attach")
+        guard FileManager.default.isExecutableFile(atPath: script.path) else {
+            throw AlchemacError.message("앱의 실행 환경이 누락됐습니다. 앱을 다시 설치해 주세요.")
+        }
+        process.executableURL = script
+    }
+
     /// Runs a program's registered Windows uninstaller in the program's own environment.
     static func configureUninstall(_ process: Process, launcher: Launcher, command: String, store: LauncherStore, runtime: URL = root, resources: URL? = nil) throws {
         guard launcher.kind == .installed, !command.isEmpty, command.count <= 2048,

@@ -229,6 +229,38 @@ struct SelfTests {
         try check(uninstallProcess.arguments == ["alchemac-" + installed.id, resources.appendingPathComponent("prefix-profile.exe").path, "--command",
                                                  AlchemacRuntime.windows(resources.appendingPathComponent("Fonts/NanumGothic-Regular.ttf")), toolEntry!.command]
                   && uninstallProcess.environment?["WINEPREFIX"] == store.sharedPrefix.path, "uninstaller runs as one command line in the program's environment")
+        let patch = portable.appendingPathComponent("patch.exe")
+        try Data("patch".utf8).write(to: patch)
+        let toolProcess = Process()
+        try AlchemacRuntime.configureTool(toolProcess, tool: patch, for: imported, store: store, runtime: mock, resources: resources)
+        try check(toolProcess.arguments?[2] == "--setup" && toolProcess.arguments?.last == AlchemacRuntime.windows(patch.standardizedFileURL)
+                  && toolProcess.environment?["WINEPREFIX"] == (try store.prefix(imported)).path
+                  && toolProcess.environment?["HADRON_WORKDIR"] == patch.standardizedFileURL.deletingLastPathComponent().path, "a tool EXE runs in the chosen program's own prefix from its folder")
+        try rejects("attaching needs the session-attach script") { try AlchemacRuntime.configureAttachedTool(Process(), tool: patch, for: imported, store: store, runtime: mock, resources: resources) }
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: resources.appendingPathComponent("session-attach"))
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: resources.appendingPathComponent("session-attach").path)
+        let attachProcess = Process()
+        try AlchemacRuntime.configureAttachedTool(attachProcess, tool: patch, for: imported, store: store, runtime: mock, resources: resources)
+        try check(attachProcess.executableURL == resources.appendingPathComponent("session-attach") && attachProcess.arguments == toolProcess.arguments
+                  && attachProcess.environment?["WINEPREFIX"] == toolProcess.environment?["WINEPREFIX"], "attaching joins the same prefix with the same arguments, without a second supervisor")
+        try check(toolProcess.environment?["DOTNET_BUNDLE_EXTRACT_BASE_DIR"] == "C:\\windows\\temp\\sample-dotnet", "a tool runs with the program's add-on settings")
+        func pe(_ magic: UInt16, clr: Bool) -> Data {
+            var image = Data(count: 1024); image[0] = 0x4d; image[1] = 0x5a; image[0x3c] = 0x80
+            image[0x80] = 0x50; image[0x81] = 0x45
+            let optional = 0x80 + 24; image[optional] = UInt8(magic & 0xff); image[optional + 1] = UInt8(magic >> 8)
+            if clr { image[optional + (magic == 0x20b ? 112 : 96) + 14 * 8] = 0x08 }
+            return image
+        }
+        let dotnet = portable.appendingPathComponent("dotnet.exe"), native = portable.appendingPathComponent("native.exe"), dotnet64 = portable.appendingPathComponent("dotnet64.exe")
+        try pe(0x10b, clr: true).write(to: dotnet); try pe(0x20b, clr: false).write(to: native); try pe(0x20b, clr: true).write(to: dotnet64)
+        let monoPrefix = temp.appendingPathComponent("mono-prefix")
+        try check(store.needsWineMono(dotnet, in: monoPrefix) && store.needsWineMono(dotnet64, in: monoPrefix) && !store.needsWineMono(native, in: monoPrefix) && !store.needsWineMono(patch, in: monoPrefix),
+                  "only .NET Framework programs need Wine Mono")
+        let monoLibrary = monoPrefix.appendingPathComponent("drive_c/windows/mono/mono-2.0/bin")
+        try fm.createDirectory(at: monoLibrary, withIntermediateDirectories: true)
+        try Data().write(to: monoLibrary.appendingPathComponent("libmono-2.0-x86_64.dll"))
+        try check(!store.needsWineMono(dotnet, in: monoPrefix), "a prefix with Wine Mono needs nothing more")
+        try rejects("tool must be an EXE") { try AlchemacRuntime.configureTool(Process(), tool: portable.appendingPathComponent("data/table.bin"), for: imported, store: store, runtime: mock, resources: resources) }
         try rejects("uninstaller only for installed programs") { try AlchemacRuntime.configureUninstall(Process(), launcher: copied, command: "x.exe", store: store, runtime: mock, resources: resources) }
         try rejects("uninstall command with control characters refused") { try AlchemacRuntime.configureUninstall(Process(), launcher: installed, command: "a\nb", store: store, runtime: mock, resources: resources) }
         try check(try store.deletionFolders(for: copied, environmentToo: true) == [store.directory(copied)], "copied program deletes only its private copy")

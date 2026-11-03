@@ -79,14 +79,15 @@ optional `README.md` and `LICENSE`. Nothing else in the folder is installed.
 the DMG). It needs Xcode command line tools, an llvm-mingw toolchain for the
 small Windows helper, and a Hadron runtime built from Hadron 0.3.0
 (commit `2faae2af7dbcd0b6448bea5c86c20c33548a792c`) with the patches in
-`hadron/`. See `hadron/README.md`.
+`hadron/`. See `hadron/README.md`. Place `wine-mono-11.3.0-x86.msi` (from
+https://dl.winehq.org/wine/wine-mono/11.3.0/) and its `COPYING` in `work/wine-mono/`.
 
 ## License
 
 Alchemac's own code is MIT licensed (`LICENSE`). The app bundles the Hadron
 runtime (BSD-3-Clause, © 2026 David Andrews) and the components it contains,
-including Wine (LGPL-2.1), FEX (MIT), DXMT, Mesa and FFmpeg, each under its own
-license. All license texts are in the app under **관리 ▸ 오픈소스 라이선스**.
+including Wine (LGPL-2.1), FEX (MIT), DXMT, Mesa and FFmpeg, and Wine Mono, each
+under its own license. All license texts are in the app under **관리 ▸ 오픈소스 라이선스**.
 Changes Alchemac makes to Hadron and FEX are published in `hadron/`.
 
 Alchemac is an independent project. It is not affiliated with or endorsed by

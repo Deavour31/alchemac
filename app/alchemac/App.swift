@@ -133,6 +133,9 @@ final class LibraryModel: ObservableObject {
         let wantsEnglish = selected.addon.flatMap(store.addon)?.englishInput ?? false
         let switched = wantsEnglish ? EnglishInput.ensure() : nil
         do { try session.start(selected, store: store) } catch { self.error(error); return }
+        if let exe = try? store.executable(selected), let prefix = try? store.prefix(selected), store.needsWineMono(exe, in: prefix) {
+            session.message += "\n.NET 실행 환경(Wine Mono)을 처음 한 번 설치합니다. 창이 뜰 때까지 1~2분 걸립니다."
+        }
         if let switched {
             session.message += "\n입력기를 \(switched)(으)로 바꿨습니다. 이 프로그램 창은 영문 입력 상태에서 눌러 주세요. 한글 입력 상태에서는 오류가 날 수 있습니다."
         }
@@ -195,6 +198,32 @@ final class LibraryModel: ObservableObject {
                 try self.session.install(file, environment: environment, store: self.store) { [weak self] in self?.offerInstalled(since: before, in: environment) }
             } catch { self.error(error) }
         }
+    }
+    /// Runs a patch or tool EXE in the selected program's own Wine environment.
+    func runTool() {
+        guard let launcher = selected else { return }
+        let panel = NSOpenPanel()
+        panel.title = "‘\(launcher.name)’ 환경에서 실행할 EXE 선택"
+        panel.message = "패치나 도구를 이 프로그램과 같은 Wine 환경에서 실행합니다. 프로그램이 실행 중이면 그 세션에 합류합니다. 선택한 파일은 수정하지 않습니다."
+        panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let file = panel.url else { return }
+        if let id = launcher.addon, store.addon(id)?.englishInput == true, let name = EnglishInput.ensure() {
+            session.message = "입력 소스를 ‘\(name)’(으)로 바꿨습니다."
+        }
+        do {
+            if let running = selectedSession {
+                guard !running.stopping else { throw AlchemacError.message("세션을 종료하는 중입니다. 끝난 뒤 다시 시도해 주세요.") }
+                try session.attachTool(file, for: launcher, store: store)
+            } else {
+                try session.runTool(file, for: launcher, store: store) { [weak self] in self?.refreshRetina() }
+            }
+            if let prefix = try? store.prefix(launcher), store.needsWineMono(file, in: prefix) {
+                session.message += "\n.NET 실행 환경(Wine Mono)을 처음 한 번 설치합니다. 창이 뜰 때까지 1~2분 걸립니다."
+            }
+            if launcher.kind == .copied, let game = try? store.game(launcher) {
+                session.message += "\n프로그램 폴더를 물으면 \(AlchemacRuntime.windows(game)) 를 지정하세요."
+            }
+        } catch { self.error(error) }
     }
     struct EnvironmentChoice {
         /// nil is the shared environment.
@@ -446,6 +475,7 @@ struct LibraryView: View {
                     Button("이름 변경", action: model.rename).disabled(locked || selectedRunning || model.selected == nil)
                     Button("목록에서 제거", action: model.remove).disabled(locked || selectedRunning || model.selected == nil)
                     Button("프로그램 삭제…", action: model.deleteProgram).disabled(locked || selectedRunning || model.selected == nil)
+                    Button("이 프로그램 환경에서 EXE 실행…", action: model.runTool).disabled(locked || model.selected == nil || model.selectedSession?.stopping == true)
                     if let selected = model.selected {
                         Divider()
                         let scope = selected.privatePrefix ? "이 프로그램 Wine 환경의" : "이 Wine 환경의"

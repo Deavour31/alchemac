@@ -1,0 +1,45 @@
+#!/bin/sh
+# Starts one more program inside the running standalone-run session of a prefix, such as
+# a patch while a launcher waits. Same Wine build, same wineserver: the supervisor keeps
+# the session until this program ends too, and its stop covers this program.
+# WINEPREFIX, HADRON_SUPPORT and HADRON_LOGS are the values the session was started with.
+# Usage: session-attach <safe-id> <absolute-exe> [args...]
+# Exit 75: no running session in this prefix to join.
+[ $# -ge 2 ] || { echo "usage: $0 <safe-id> <absolute-exe> [args...]" >&2; exit 2; }
+case "$1" in ''|*[!A-Za-z0-9_-]*) echo "attach: invalid id" >&2; exit 2 ;; esac
+for path in "${WINEPREFIX:-}" "${HADRON_SUPPORT:-}" "${HADRON_LOGS:-}"; do
+    case "$path" in /*) ;; *) echo "attach: explicit absolute paths required" >&2; exit 2 ;; esac
+done
+parent=$(cd "$(dirname "$WINEPREFIX")" && pwd -P) || exit 75
+WINEPREFIX="$parent/$(basename "$WINEPREFIX")"
+base=$(cd "$HADRON_SUPPORT" && pwd -P) || exit 75
+scope="$base/prefix-sessions/$(printf '%s' "$WINEPREFIX" | /sbin/md5 -q)"
+
+# Only a session that is fully set up and not stopping: never a prefix being created.
+[ "$(cat "$scope/owner-prefix" 2>/dev/null)" = "$WINEPREFIX" ] || { echo "attach: no session" >&2; exit 75; }
+[ "$(cat "$scope/active-prefix" 2>/dev/null)" = "$WINEPREFIX" ] || { echo "attach: session not active" >&2; exit 75; }
+[ ! -f "$scope/stop-request" ] || { echo "attach: session stopping" >&2; exit 75; }
+supervisor=$(cat "$scope/supervisor-pid" 2>/dev/null)
+case "$supervisor" in ''|*[!0-9]*) exit 75 ;; esac
+kill -0 "$supervisor" 2>/dev/null || { echo "attach: supervisor gone" >&2; exit 75; }
+
+# The runtime copy this prefix's wineserver runs from: a client of another build cannot join it.
+server="server-$(stat -f '%Xd-%Xi' "$WINEPREFIX" | tr 'A-F' 'a-f')"
+ROOT=
+for pid in $(pgrep -x wineserver); do
+    case "$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')" in
+        */"$server")
+            ROOT=$(lsof -a -p "$pid" -d txt -Fn 2>/dev/null | sed -n 's/^n//p' | sed -n 's|/dist/bin/wineserver$||p' | head -1)
+            break ;;
+    esac
+done
+case "$ROOT" in "$scope"/runtimes/*) ;; *) echo "attach: wineserver not found" >&2; exit 75 ;; esac
+
+export WINEPREFIX HADRON_SCOPE_DIR="$scope" HADRON_SUPPORT="$scope" HADRON_LOGS
+export HADRON_PROCESS_SCOPE=prefix HADRON_STANDALONE=1 HADRON_WATCHDOG=0
+. "$ROOT/scripts/standalone-common.sh"
+standalone_scope_valid || { echo "attach: scope mismatch" >&2; exit 75; }
+mkdir -p "$HADRON_LOGS" || exit 1
+exec >>"$HADRON_LOGS/$1-attach.log" 2>&1
+echo "attach: runtime $(cat "$ROOT/BUILD-ID"); session=$supervisor"
+exec "$ROOT/scripts/play" "$@"

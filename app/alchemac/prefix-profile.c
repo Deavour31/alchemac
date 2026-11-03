@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <wchar.h>
 #include <string.h>
+#include <stddef.h>
 
 static int fail(const char *step) {
     fprintf(stderr, "prefix-profile: %s failed (Win32 %lu)\n", step, GetLastError());
@@ -149,6 +150,51 @@ static void set_dpi_override(const wchar_t *exe, BOOL scaled) {
     RegCloseKey(key);
 }
 
+/* .NET Framework programs carry a CLR header and need Wine Mono, which a prefix does not
+ * have until something asks for it. .NET 5+ apphosts are ordinary native programs. */
+static BOOL needs_clr(const wchar_t *exe) {
+    HANDLE file = CreateFileW(exe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    IMAGE_DOS_HEADER dos; IMAGE_NT_HEADERS32 nt; DWORD got = 0; BOOL clr = FALSE;
+    if (ReadFile(file, &dos, sizeof(dos), &got, NULL) && got == sizeof(dos) && dos.e_magic == IMAGE_DOS_SIGNATURE
+            && SetFilePointer(file, dos.e_lfanew, NULL, FILE_BEGIN) != INVALID_SET_FILE_POINTER
+            && ReadFile(file, &nt, sizeof(nt), &got, NULL) && got == sizeof(nt) && nt.Signature == IMAGE_NT_SIGNATURE) {
+        if (nt.OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+            clr = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress != 0;
+        else if (nt.OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+            clr = ((IMAGE_NT_HEADERS64 *)&nt)->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR
+                && SetFilePointer(file, dos.e_lfanew + offsetof(IMAGE_NT_HEADERS64, OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR]), NULL, FILE_BEGIN) != INVALID_SET_FILE_POINTER
+                && ReadFile(file, &nt.OptionalHeader.DataDirectory[0], sizeof(IMAGE_DATA_DIRECTORY), &got, NULL) && got == sizeof(IMAGE_DATA_DIRECTORY)
+                && nt.OptionalHeader.DataDirectory[0].VirtualAddress != 0;
+    }
+    CloseHandle(file);
+    return clr;
+}
+
+/* Installs the Wine Mono package kept beside this helper, once per prefix, and waits for it. */
+static void ensure_mono(const wchar_t *exe) {
+    if (!needs_clr(exe)) return;
+    wchar_t check[MAX_PATH], msi[MAX_PATH], command[MAX_PATH * 2];
+    UINT length = GetWindowsDirectoryW(check, MAX_PATH);
+    if (!length || length + 48 > MAX_PATH) return;
+    wcscat(check, L"\\mono\\mono-2.0\\bin\\libmono-2.0-x86_64.dll");
+    if (GetFileAttributesW(check) != INVALID_FILE_ATTRIBUTES) return;
+    DWORD size = GetModuleFileNameW(NULL, msi, MAX_PATH);
+    if (!size || size >= MAX_PATH) return;
+    wchar_t *slash = wcsrchr(msi, L'\\');
+    if (!slash || (size_t)(slash - msi) + 16 > MAX_PATH) return;
+    wcscpy(slash + 1, L"wine-mono.msi");
+    if (GetFileAttributesW(msi) == INVALID_FILE_ATTRIBUTES) { printf("prefix-profile: Wine Mono package missing\n"); return; }
+    if (swprintf(command, MAX_PATH * 2, L"msiexec.exe /i \"%ls\" /qn", msi) < 0) return;
+    STARTUPINFOW startup = {0}; PROCESS_INFORMATION child = {0}; startup.cb = sizeof(startup);
+    printf("prefix-profile: installing Wine Mono for a .NET Framework program\n");
+    if (!CreateProcessW(NULL, command, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &child)) { fail("Wine Mono install"); return; }
+    WaitForSingleObject(child.hProcess, INFINITE);
+    DWORD status = 1; GetExitCodeProcess(child.hProcess, &status);
+    CloseHandle(child.hThread); CloseHandle(child.hProcess);
+    printf("prefix-profile: Wine Mono install exit=%lu\n", status);
+}
+
 /* Programs a launcher starts, such as a Unity game next to its launcher, are named by
  * their own file, so every EXE beside the registered one gets the same override. */
 static void set_folder_dpi_override(const wchar_t *exe, BOOL scaled) {
@@ -206,6 +252,7 @@ int wmain(int argc, wchar_t **argv) {
     }
     DWORD attributes = GetFileAttributesW(argv[3]);
     if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) return fail("launcher file");
+    ensure_mono(argv[3]);
     size_t length = wcslen(argv[3]);
     wchar_t *command = HeapAlloc(GetProcessHeap(), 0, (length + 3) * sizeof(wchar_t));
     if (!command) return fail("command allocation");
