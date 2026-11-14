@@ -16,7 +16,7 @@ RUNTIME = next((d for d in (ROOT / 'work/hadron-prototype' / b / PROFILE['runtim
 if RUNTIME is None: raise SystemExit('Runtime build not found: ' + PROFILE['runtime_build_id'])
 RELEASE = '--release' in sys.argv[1:]
 BUNDLE_ID = 'io.github.deavour31.alchemac'
-VERSION, BUILD = '0.5.5', '26'
+VERSION, BUILD = '0.5.6', '27'
 # https://dl.winehq.org/wine/wine-mono/11.3.0/wine-mono-11.3.0-x86.msi, the version this Wine asks for.
 WINE_MONO_SHA256 = 'df2dfc1665c2511882e7cabd56eafd0c0a3d94e5a7e86f969277f6c189d418d3'
 PARENT = ROOT / ('outputs/alchemac-release.noindex' if RELEASE else 'outputs/alchemac-app-build.noindex')

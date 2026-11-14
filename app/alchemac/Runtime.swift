@@ -110,7 +110,8 @@ enum AlchemacRuntime {
         // Prepare this locked prefix, then start the program as a child.
         // standalone-run waits for the whole Wine session, not just this helper.
         process.arguments = [session, profile.path, mode, windows(font), target]
-        process.currentDirectoryURL = workdir
+        // A new environment has no drive_c yet; the launch directory must exist, HADRON_WORKDIR may still name it.
+        process.currentDirectoryURL = fm.fileExists(atPath: workdir.path) ? workdir : prefix.deletingLastPathComponent()
         // No inherited host tokens, Wine/CrossOver state, DYLD injection or shell evaluation.
         var environment = [
             "HOME": fm.homeDirectoryForCurrentUser.path, "USER": NSUserName(),

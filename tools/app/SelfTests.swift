@@ -293,6 +293,13 @@ struct SelfTests {
         try AlchemacRuntime.configureRegistry(registryProcess, prefix: lab, script: script, store: store, runtime: mock, resources: resources)
         try check(registryProcess.arguments?[2] == "--command" && registryProcess.arguments?.last == "regedit.exe /S \"" + AlchemacRuntime.windows(script) + "\""
                   && registryProcess.environment?["WINEPREFIX"] == lab.path, "registry changes import with regedit in the chosen environment")
+        let fresh = store.prefix(environment: "fresh-retina")
+        try check(!fm.fileExists(atPath: fresh.path), "the new environment's prefix does not exist yet")
+        let freshProcess = Process()
+        try AlchemacRuntime.configureRegistry(freshProcess, prefix: fresh, script: script, store: store, runtime: mock, resources: resources)
+        try check(freshProcess.environment?["HADRON_WORKDIR"] == fresh.appendingPathComponent("drive_c").path
+                  && freshProcess.currentDirectoryURL.map { fm.fileExists(atPath: $0.path) } == true,
+                  "a new environment launches from an existing directory while the workdir stays drive_c")
         try check(try String(contentsOf: script, encoding: .utf8) == on, "registry script holds exactly the settings")
         let ownPrefixProcess = Process()
         try AlchemacRuntime.configureRegistry(ownPrefixProcess, prefix: store.prefix(imported), script: script, store: store, runtime: mock, resources: resources)

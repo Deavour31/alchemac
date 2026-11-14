@@ -41,10 +41,12 @@ final class LibraryModel: ObservableObject {
     }
     /// Switches a prefix's Retina mode with regedit; creates the environment if it is new.
     func applyRetina(_ on: Bool, prefix: URL, place: String, then: @escaping (Bool) -> Void) {
+        var script: URL?
         do {
-            let script = try store.registryScript(LauncherStore.retinaRegistry(on: on))
-            try session.applyRegistry(script, prefix: prefix, title: place + (on ? " 선명한 화면 켜기" : " 선명한 화면 끄기"), store: store) { [weak self] in
-                try? FileManager.default.removeItem(at: script)
+            let file = try store.registryScript(LauncherStore.retinaRegistry(on: on))
+            script = file
+            try session.applyRegistry(file, prefix: prefix, title: place + (on ? " 선명한 화면 켜기" : " 선명한 화면 끄기"), store: store) { [weak self] in
+                try? FileManager.default.removeItem(at: file)
                 guard let self else { return }
                 self.refreshRetina()
                 let ok = self.retinaOn(prefix: prefix) == on
@@ -53,7 +55,10 @@ final class LibraryModel: ObservableObject {
                     : "\n설정이 적용되지 않았습니다. 진단 로그를 확인해 주세요."
                 then(ok)
             }
-        } catch { self.error(error); then(false) }
+        } catch {
+            if let script { try? FileManager.default.removeItem(at: script) }
+            self.error(error); then(false)
+        }
     }
     /// Add-ons, refreshed whenever they change.
     @Published var addons: [Addon] = []

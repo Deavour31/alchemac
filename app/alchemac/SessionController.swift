@@ -123,6 +123,7 @@ final class SessionController: ObservableObject {
         let session = Session(prefix: prefix, launcherID: id, title: title, process: next, output: handle)
         do { try next.run() } catch {
             try? handle.close()
+            try? FileManager.default.removeItem(at: outer)
             throw error
         }
         session.after = then
