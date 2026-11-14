@@ -80,8 +80,8 @@ static BOOL family_present(const wchar_t *name) {
  * Links name files: Wine prefers a newer macOS NanumGothic.ttc over the copy in
  * C:\windows\Fonts when the Mac has one, so both file names are linked. */
 static void link_korean_ui(void) {
-    static const wchar_t *korean[] = {L"Gulim", L"GulimChe", L"Dotum", L"DotumChe", L"Batang", L"Malgun Gothic",
-        L"\xad74\xb9bc", L"\xb3cb\xc6c0", L"\xbc14\xd0d5", L"\xb9d1\xc740 \xace0\xb515"}; /* 굴림 돋움 바탕 맑은 고딕 */
+    static const wchar_t *korean[] = {L"Gulim", L"GulimChe", L"Dotum", L"DotumChe", L"Batang", L"Gungsuh", L"Malgun Gothic",
+        L"\xad74\xb9bc", L"\xb3cb\xc6c0", L"\xbc14\xd0d5", L"\xad81\xc11c", L"\xb9d1\xc740 \xace0\xb515"}; /* 굴림 돋움 바탕 궁서 맑은 고딕 */
     static const wchar_t *ui[] = {L"Tahoma", L"Microsoft Sans Serif", L"Lucida Sans Unicode", L"Segoe UI"};
     static const wchar_t *links[] = {L"NanumGothic.ttc,NanumGothic", L"NanumGothic-Regular.ttf,NanumGothic"};
     static const wchar_t nanum[] = L"NanumGothic";
@@ -128,7 +128,33 @@ static void link_korean_ui(void) {
         }
         RegCloseKey(key);
     }
+    /* DirectWrite (WPF, modern UI toolkits) ignores both of the above and only honours
+     * Wine's own Fonts\Replacements, so the same families are mapped there. */
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Wine\\Fonts\\Replacements",
+            0, NULL, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, NULL, &key, NULL) == ERROR_SUCCESS) {
+        for (size_t i = 0; i < ARRAYSIZE(korean); i++) {
+            wchar_t current[LF_FACESIZE]; DWORD size = sizeof(current);
+            if (family_present(korean[i]) || RegQueryValueExW(key, korean[i], NULL, NULL, (BYTE *)current, &size) == ERROR_SUCCESS) continue;
+            if (RegSetValueExW(key, korean[i], 0, REG_SZ, (const BYTE *)nanum, nanum_size) == ERROR_SUCCESS) changed++;
+        }
+        RegCloseKey(key);
+    }
     printf("prefix-profile: Korean UI font fallback updated (%u entries)\n", changed);
+}
+
+/* WPF renders through Direct3D 9 hardware acceleration, which crashes or redraws only
+ * part of a window on the translated graphics stack. Its software renderer is reliable
+ * and only affects WPF. Written once so an environment that sets it either way keeps it. */
+static void default_wpf_software(void) {
+    HKEY key;
+    DWORD value = 1, size = sizeof(value), type;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Avalon.Graphics",
+            0, NULL, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS) return;
+    DWORD existing;
+    if (RegQueryValueExW(key, L"DisableHWAcceleration", NULL, &type, (BYTE *)&existing, &size) != ERROR_SUCCESS
+            && RegSetValueExW(key, L"DisableHWAcceleration", 0, REG_DWORD, (const BYTE *)&value, sizeof(value)) == ERROR_SUCCESS)
+        printf("prefix-profile: WPF software rendering enabled\n");
+    RegCloseKey(key);
 }
 
 /* Per-program DPI override, read by Wine from AppCompatFlags\Layers by lower-case
@@ -227,6 +253,7 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (install_font(argv[2])) return 1;
     link_korean_ui();
+    default_wpf_software();
     if (!wcscmp(argv[1], L"--check")) return 0;
     if (!wcscmp(argv[1], L"--command")) {
         /* A registered Windows command line, such as an UninstallString, parsed by

@@ -79,8 +79,14 @@ optional `README.md` and `LICENSE`. Nothing else in the folder is installed.
 the DMG). It needs Xcode command line tools, an llvm-mingw toolchain for the
 small Windows helper, and a Hadron runtime built from Hadron 0.3.0
 (commit `2faae2af7dbcd0b6448bea5c86c20c33548a792c`) with the patches in
-`hadron/`. See `hadron/README.md`. Place `wine-mono-11.3.0-x86.msi` (from
+`hadron/`, then patched with `tools/runtime/patch-locale-nls.py <runtime> <new-runtime>`
+(Korean calendar era name in Wine's locale data). See `hadron/README.md`. Place `wine-mono-11.3.0-x86.msi` (from
 https://dl.winehq.org/wine/wine-mono/11.3.0/) and its `COPYING` in `work/wine-mono/`.
+
+Before every launch the Windows helper (`prefix-profile.c`) prepares the environment's prefix:
+Korean font fallbacks (GDI substitutes/links and DirectWrite replacements, only where
+the font is absent and no entry exists) and WPF software rendering
+(`Avalon.Graphics\DisableHWAcceleration=1`, kept if already set).
 
 ## License
 

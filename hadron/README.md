@@ -13,6 +13,10 @@ Alchemac runs on the Hadron runtime, release 0.3.0
 - `patches/fex/0006-…`: FEX cooperative suspension on conditional backedges. It fixes
   programs that hang while another thread suspends a JIT thread in a tight loop. This
   patch is kept downstream and is not submitted to FEX.
+- Wine locale data fix, applied to a built runtime by `tools/runtime/patch-locale-nls.py`:
+  `nls/locale.nls` listed an empty era name for the Korean calendar, where Windows returns
+  the Dangi era name. Delphi-built programs crash at startup in a Korean locale because of
+  it. The script inserts the name (16 bytes) and checks the result by re-parsing the file.
 
 Apply with `git -C hadron apply alchemac-hadron.patch`, then build the runtime as Hadron
 documents. Hadron and each component keep their own licenses.
