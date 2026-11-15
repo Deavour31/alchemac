@@ -396,6 +396,505 @@ index 0000000..8b86384
 +-- 
 +2.54.0 (Apple Git-157)
 +
+diff --git a/patches/mtld3d/0004-d3d9-Let-GetDC-read-back-non-lockable-render-targets.patch b/patches/mtld3d/0004-d3d9-Let-GetDC-read-back-non-lockable-render-targets.patch
+new file mode 100644
+index 0000000..43a3279
+--- /dev/null
++++ b/patches/mtld3d/0004-d3d9-Let-GetDC-read-back-non-lockable-render-targets.patch
+@@ -0,0 +1,114 @@
++From 28e6e7780582b2de2e96b50ddfe4b17078943299 Mon Sep 17 00:00:00 2001
++From: Alchemac <noreply@alchemac.invalid>
++Date: Mon, 16 Nov 2026 00:30:17 +0900
++Subject: [PATCH] d3d9: Let GetDC read back non-lockable render targets and
++ back buffers
++
++WPF hardware rendering calls GetDC on its render target / back buffer, which
++is not lockable. GetDC returned D3DERR_INVALIDCALL for it, so GDI drawing
++into the surface failed.
++
++Treat any GPU-only colour surface (the implicit back buffer, or a standalone
++non-lockable render target) as a read-back target: GetDC flushes and reads the
++surface back into a snapshot the DIB wraps, and ReleaseDC uploads the page back.
++A standalone render target is marked read-back first so its colour stays live.
++
++---
++ windows/d3d9/src/surface.rs | 53 ++++++++++++++++++++++++++++++-------
++ 1 file changed, 44 insertions(+), 9 deletions(-)
++
++diff --git a/windows/d3d9/src/surface.rs b/windows/d3d9/src/surface.rs
++index a22707c..ca3a6f6 100644
++--- a/windows/d3d9/src/surface.rs
+++++ b/windows/d3d9/src/surface.rs
++@@ -2499,6 +2499,11 @@ fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)>
++     // SAFETY: `device_inner` is non-null (checked) and points to the live owning
++     // device, which outlives its child surfaces per D3D9 lifetime rules.
++     let device_inner = unsafe { &mut *inner.device_inner };
+++    if inner.implicit_kind != ImplicitKind::Backbuffer {
+++        // A standalone render target is read right after the flush: mark it
+++        // read-back first so the store-action rules keep its colour live.
+++        device_inner.push_control(crate::device::NoteColorReadOp { src: tex_handle });
+++    }
++     device_inner.flush_current_frame_blocking().ok()?;
++     let mut params = BlitTextureToBufferParams {
++         planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
++@@ -3087,6 +3092,25 @@ impl SurfaceInner {
++             && !self.live_color_handle().is_null()
++     }
++ 
+++    /// True for a GPU-only colour surface whose `GetDC` goes through a read-back snapshot.
+++    ///
+++    /// The implicit back buffer (lockable or not) and a standalone,
+++    /// non-lockable render target: colour texture, no CPU staging, no parent
+++    /// texture. `GetDC` reads such a surface back into `readback` and the DIB
+++    /// wraps that page; `ReleaseDC` uploads the page back. Depth-stencil
+++    /// surfaces have no colour handle and never qualify.
+++    fn is_dc_readback_target(&self) -> bool {
+++        match self.implicit_kind {
+++            ImplicitKind::Backbuffer => true,
+++            ImplicitKind::None => {
+++                self.parent_texture.is_null()
+++                    && self.system_memory.is_none()
+++                    && !self.live_color_handle().is_null()
+++            }
+++            ImplicitKind::DepthStencil => false,
+++        }
+++    }
+++
++     /// Resolve the CPU pixel store this surface exposes through `GetDC`.
++     ///
++     /// `None` for a surface kind with no host-readable pixels (a GPU-only
++@@ -3125,7 +3149,7 @@ impl SurfaceInner {
++         // persistent CPU store. `surface_get_dc` performs a full read-back into
++         // `self.readback` immediately before this call, so a held DC reads the
++         // backbuffer's current pixels (BGRA8, matching the X8R8G8B8 DIB order).
++-        if self.implicit_kind == ImplicitKind::Backbuffer {
+++        if self.is_dc_readback_target() {
++             let page = self.readback.as_ref()?;
++             let format = self.live_format();
++             let fmt = mtld3d_core::format::map_d3d_format(format)?;
++@@ -3279,13 +3303,24 @@ extern "system" fn surface_get_dc(this: *mut c_void, hdc: *mut *mut c_void) -> i
++     if (unsafe { &*inner.dc_lock_ptr() }).map_count != 0 {
++         return D3DERR_INVALIDCALL;
++     }
++-    // A LOCKABLE implicit backbuffer is GPU-only: snapshot it via a full
++-    // read-back into `readback` so `dc_pixels` (and the DIB it seeds) have host
++-    // pixels. A NON-lockable backbuffer rejects GetDC: the
++-    // `is_lockable_backbuffer` guard is false, so we skip the read-back and fall
++-    // through to `dc_pixels` → None → INVALIDCALL with the out-HDC left untouched.
++-    if inner.is_lockable_backbuffer() && readback_full_backbuffer(inner).is_none() {
++-        return D3DERR_INVALIDCALL;
+++    // The implicit back buffer and a non-lockable render target are GPU-only:
+++    // snapshot them via a full read-back into `readback` so `dc_pixels` (and
+++    // the DIB it seeds) have host pixels, as WPF-style presenters expect from
+++    // `GetDC` on a back buffer. A format with no GDI mapping is rejected before
+++    // any GPU work.
+++    if inner.is_dc_readback_target() {
+++        if dc_format_info(inner.live_format()).is_none() {
+++            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+++                "IDirect3DSurface9::GetDC: format has no GDI mapping → INVALIDCALL");
+++            return D3DERR_INVALIDCALL;
+++        }
+++        if !inner.is_lockable_backbuffer() {
+++            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+++                "IDirect3DSurface9::GetDC on a non-lockable render target / back buffer: using GPU read-back snapshot");
+++        }
+++        if readback_full_backbuffer(inner).is_none() {
+++            return D3DERR_INVALIDCALL;
+++        }
++     }
++     // A lockable standalone render target keeps its pixels in the colour
++     // texture the GPU writes and hands the DC a DIB over its CPU staging, so
++@@ -3447,7 +3482,7 @@ extern "system" fn surface_release_dc(this: *mut c_void, hdc: *mut c_void) -> i3
++     // The back buffer's DC wraps the read-back snapshot page rather than any
++     // persistent store, so GDI's drawing exists only there: push it back into
++     // the back buffer before the page is dropped just below.
++-    if inner.is_lockable_backbuffer() {
+++    if inner.is_dc_readback_target() {
++         backbuffer_dc_upload(inner);
++     }
++     // A backbuffer GetDC stashed a full read-back snapshot in `readback`; drop it
++-- 
++2.54.0 (Apple Git-157)
++
+diff --git a/patches/mtld3d/0005-d3d9-Keep-an-additional-swap-chain-s-back-buffer-ali.patch b/patches/mtld3d/0005-d3d9-Keep-an-additional-swap-chain-s-back-buffer-ali.patch
+new file mode 100644
+index 0000000..783bff8
+--- /dev/null
++++ b/patches/mtld3d/0005-d3d9-Keep-an-additional-swap-chain-s-back-buffer-ali.patch
+@@ -0,0 +1,150 @@
++From adb32d1e3507ec8766d03263ebb201bedf433989 Mon Sep 17 00:00:00 2001
++From: Alchemac <noreply@alchemac.invalid>
++Date: Mon, 16 Nov 2026 00:30:17 +0900
++Subject: [PATCH] d3d9: Keep an additional swap chain's back buffer alive while
++ the app holds it
++
++With WPF hardware rendering the app can Release an additional swap chain
++while still holding its back buffer, then Release the back buffer later. The
++swap chain finalize freed the back buffer surface, so the later Release
++crashed on freed memory.
++
++Orphan the back buffer instead of freeing it when the app still references it:
++mark it ORPHANED and clear its swap chain pointer, so its own last Release
++frees it like an ordinary surface.
++
++---
++ windows/d3d9/src/surface.rs   | 65 +++++++++++++++++++++++++++++++----
++ windows/d3d9/src/swapchain.rs |  5 +--
++ 2 files changed, 62 insertions(+), 8 deletions(-)
++
++diff --git a/windows/d3d9/src/surface.rs b/windows/d3d9/src/surface.rs
++index ca3a6f6..4c84996 100644
++--- a/windows/d3d9/src/surface.rs
+++++ b/windows/d3d9/src/surface.rs
++@@ -677,6 +677,18 @@ impl Direct3DSurface9 {
++         self.inner().flags.contains(SurfaceFlags::CONTAINER_CACHED)
++     }
++ 
+++    /// Whether this implicit-kind surface may be freed by its own last release.
+++    ///
+++    /// True for an ordinary surface and for an orphaned swapchain back buffer;
+++    /// false for a device-owned implicit surface still owned by its owner and
+++    /// for a container-cached sub-surface.
+++    fn freed_by_own_release(&self) -> bool {
+++        let inner = self.inner();
+++        (inner.implicit_kind == ImplicitKind::None
+++            || inner.flags.contains(SurfaceFlags::ORPHANED))
+++            && !inner.flags.contains(SurfaceFlags::CONTAINER_CACHED)
+++    }
+++
++     /// Whether this surface currently has an outstanding `LockRect`.
++     ///
++     /// D3D9 rejects `UpdateSurface` and `GetDC` when the surface is mapped. A
++@@ -1058,6 +1070,14 @@ bitflags::bitflags! {
++         /// `finalize_texture` is the single free site. Clear for every other
++         /// surface, freed on its own last release.
++         const CONTAINER_CACHED = 1 << 2;
+++        /// A swapchain-owned `Backbuffer` surface whose swapchain was released while the app still held it.
+++        ///
+++        /// D3D9 keeps such a back buffer valid until the app's last `Release`, so
+++        /// the surface is detached from the (freed) swapchain: it finalizes on its
+++        /// own last public/private release like an ordinary surface, and its
+++        /// `container` is cleared. It still resolves its Metal handle live from
+++        /// the device, which its own forwarded device reference keeps alive.
+++        const ORPHANED = 1 << 3;
++     }
++ }
++ 
++@@ -1589,7 +1609,7 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
++     // first). Any other path here with a live `implicit_kind` is a gating bug
++     // that would free a surface the device still hands out — fail loudly.
++     debug_assert!(
++-        inner.implicit_kind == ImplicitKind::None,
+++        inner.implicit_kind == ImplicitKind::None || inner.flags.contains(SurfaceFlags::ORPHANED),
++         "device-owned implicit surface finalized outside device teardown"
++     );
++     // Same invariant for a container-cached sub-surface: only
++@@ -1714,6 +1734,41 @@ pub unsafe fn finalize_implicit_surface(ptr: u64) {
++     unsafe { finalize_surface(surf) };
++ }
++ 
+++/// Tear down a swapchain-owned back buffer surface when its swapchain is finalized.
+++///
+++/// If the app no longer references the surface (public and private counts both
+++/// zero) it is finalized like [`finalize_implicit_surface`]. Otherwise it is
+++/// orphaned instead of freed: D3D9 keeps a back buffer the app still holds valid
+++/// after its swapchain is released. The surface is marked `ORPHANED` (so its own
+++/// last `Release` frees it) and its swapchain back-pointer is cleared so nothing
+++/// dereferences the freed swapchain. It keeps its forwarded device reference and
+++/// resolves its Metal handle live from the device, so `GetDesc`, `GetDevice`,
+++/// `AddRef`, `Release` and `QueryInterface` keep working.
+++///
+++/// # Safety
+++/// `ptr` must be `0` or a live swapchain-owned `Backbuffer`-kind surface that
+++/// the swapchain is about to stop owning; the pointer must not be used again by
+++/// the caller.
+++pub unsafe fn orphan_or_finalize_backbuffer(ptr: u64) {
+++    if ptr == 0 {
+++        return;
+++    }
+++    let surf = ptr as *mut Direct3DSurface9;
+++    // SAFETY: `surf` is the live cached back buffer surface wrapper.
+++    let (public, private) = unsafe { ((*surf).refcount, (*surf).private_refcount) };
+++    if public == 0 && private == 0 {
+++        // SAFETY: nothing references it; sole owner finalizes.
+++        unsafe { finalize_implicit_surface(ptr) };
+++        return;
+++    }
+++    log::debug!(target: crate::LOG_TARGET, "Direct3DSurface9 this={ptr:#x} ORPHANED (swapchain released, app still holds {public} public/{private} private)");
+++    // SAFETY: `inner` is the surface's valid `SurfaceInner`; access is exclusive
+++    // (single-threaded D3D9 objects or serialised by the device `ApiLock`).
+++    let inner = unsafe { &mut *(*surf).inner };
+++    inner.flags.insert(SurfaceFlags::ORPHANED);
+++    inner.container = 0;
+++}
+++
++ /// Finalize a container-cached sub-resource surface at its container's teardown.
++ ///
++ /// Mirrors [`finalize_implicit_surface`]: clear the ownership marker first so
++@@ -1806,10 +1861,8 @@ impl ComUnknown for Direct3DSurface9 {
++             // at their owner's teardown, which keeps the cached pointer their
++             // owner hands out valid (see `ImplicitKind` and
++             // `SurfaceFlags::CONTAINER_CACHED`).
++-            let finalize_now = obj.refcount == 0
++-                && obj.private_refcount == 0
++-                && obj.inner().implicit_kind == ImplicitKind::None
++-                && !obj.container_cached();
+++            let finalize_now =
+++                obj.refcount == 0 && obj.private_refcount == 0 && obj.freed_by_own_release();
++             (finalize_now, obj.forward_texture())
++         };
++         if finalize_now {
++@@ -1881,7 +1934,7 @@ unsafe impl crate::com_ref::ComChild for Direct3DSurface9 {
++         // Implicit surfaces are never freed by `Release` — they are destroyed
++         // only at device teardown (see `ImplicitKind`), and neither is a
++         // container-cached sub-surface, freed by its texture's finalize.
++-        self.inner().implicit_kind == ImplicitKind::None && !self.container_cached()
+++        self.freed_by_own_release()
++     }
++     fn blocks_reset_while_referenced(&self) -> bool {
++         // The implicit surfaces, and the standalone `D3DPOOL_DEFAULT` ones
++diff --git a/windows/d3d9/src/swapchain.rs b/windows/d3d9/src/swapchain.rs
++index 2f7c789..1ff1d2d 100644
++--- a/windows/d3d9/src/swapchain.rs
+++++ b/windows/d3d9/src/swapchain.rs
++@@ -199,8 +199,9 @@ unsafe fn finalize_swapchain(this: *mut Direct3DSwapChain9) {
++     let backbuffer_surface = unsafe { (*inner).backbuffer_surface };
++     if backbuffer_surface != 0 {
++         // SAFETY: a non-zero `backbuffer_surface` is a live `Backbuffer`-kind
++-        // surface created by this swapchain; finalized exactly once here.
++-        unsafe { crate::surface::finalize_implicit_surface(backbuffer_surface) };
+++        // surface created by this swapchain; finalized, or orphaned if the app
+++        // still references it, exactly once here.
+++        unsafe { crate::surface::orphan_or_finalize_backbuffer(backbuffer_surface) };
++     }
++     // SAFETY: as above — sole owner of the inner allocation.
++     drop(unsafe { Box::from_raw(inner) });
++-- 
++2.54.0 (Apple Git-157)
++
+diff --git a/patches/mtld3d/0006-d3d9-Rename-contended-staging-before-UpdateSurface-a.patch b/patches/mtld3d/0006-d3d9-Rename-contended-staging-before-UpdateSurface-a.patch
+new file mode 100644
+index 0000000..a9e89b0
+--- /dev/null
++++ b/patches/mtld3d/0006-d3d9-Rename-contended-staging-before-UpdateSurface-a.patch
+@@ -0,0 +1,88 @@
++From c942af77d26d70b391d52bf0d21ab38c7000fa5d Mon Sep 17 00:00:00 2001
++From: Alchemac <noreply@alchemac.invalid>
++Date: Mon, 16 Nov 2026 00:30:17 +0900
++Subject: [PATCH] d3d9: Rename contended staging before UpdateSurface and fill
++ writes
++
++WPF updates its glyph atlas with UpdateSurface between draws. The write went
++straight into a staging buffer an earlier recorded upload still reads, so
++those draws sampled the new bytes and showed wrong glyphs.
++
++Add prepare_staging_write, which renames a contended 2D level's staging before
++a CPU write exactly as LockRect does, and call it from the UpdateSurface /
++UpdateTexture copy and convert paths, the texture-to-texture region copy and
++the solid fill.
++
++---
++ windows/d3d9/src/texture.rs | 27 ++++++++++++++++++++++++++-
++ 1 file changed, 26 insertions(+), 1 deletion(-)
++
++diff --git a/windows/d3d9/src/texture.rs b/windows/d3d9/src/texture.rs
++index e9c6490..0c312c4 100644
++--- a/windows/d3d9/src/texture.rs
+++++ b/windows/d3d9/src/texture.rs
++@@ -1263,7 +1263,7 @@ impl TextureInner {
++         if !self.ensure_staging_for_write(dst_level, whole) {
++             return false;
++         }
++-        self.prepare_volume_staging_write(dst_level);
+++        self.prepare_staging_write(dst_level);
++         let (Some(dst_box), Some(src_box)) =
++             (self.staging.get(dst_level), src.staging.get(src_level))
++         else {
++@@ -1779,6 +1779,7 @@ impl TextureInner {
++         if !self.ensure_staging_for_write(dst_level, whole) {
++             return false;
++         }
+++        self.prepare_staging_write(dst_level);
++         let Some(dst_box) = self.staging.get(dst_level) else {
++             return false;
++         };
++@@ -1984,6 +1985,7 @@ impl TextureInner {
++         if !self.ensure_staging_for_write(dst_level, whole) {
++             return false;
++         }
+++        self.prepare_staging_write(dst_level);
++         let Some(dst_box) = self.staging.get(dst_level) else {
++             return false;
++         };
++@@ -2097,6 +2099,7 @@ impl TextureInner {
++         // A fill is a write: a level whose staging was never materialized (or
++         // was dropped after its upload) gets one here, like any first write.
++         self.ensure_staging(level);
+++        self.prepare_staging_write(level);
++         let Some(box_) = self.staging.get(level) else {
++             return false;
++         };
++@@ -2734,6 +2737,28 @@ impl TextureInner {
++             .as_mut_ptr()
++     }
++ 
+++    /// Rename a 2D level's staging before a CPU
+++    /// write (UpdateSurface / UpdateTexture / fill) when an earlier recorded upload
+++    /// still reads it, exactly as `lock_region_ptr` does for LockRect. The old Arc
+++    /// stays owned by the queued upload job, so it reads the old bytes; the fresh
+++    /// box starts as a full CPU copy so a partial dirty rect keeps the rest.
+++    /// Call after `ensure_staging_for_write` / `ensure_staging`.
+++    fn prepare_staging_write(&mut self, level: usize) {
+++        if self.flags.contains(TextureFlags::VOLUME_TEXTURE) {
+++            self.prepare_volume_staging_write(level);
+++            return;
+++        }
+++        if self.device_inner == 0 || self.dropped_staging & (1u32 << level) != 0 {
+++            return;
+++        }
+++        let coherent_seq = self.staging_coherent_seq(level);
+++        let contended = is_in_flight(self.last_submit_seq[level], coherent_seq)
+++            || self.staging[level].has_readers();
+++        if contended {
+++            self.rename_staging(level, PreserveKind::Cpu);
+++        }
+++    }
+++
++     /// Preserve a volume mip before writing bytes another owner may still read.
++     fn prepare_volume_staging_write(&mut self, level: usize) {
++         if self.flags.contains(TextureFlags::VOLUME_TEXTURE)
++-- 
++2.54.0 (Apple Git-157)
++
+diff --git a/patches/mtld3d/0007-d3d9-Supply-the-MSVC-CRT-pieces-a-mingw-CRT-i686-lin.patch b/patches/mtld3d/0007-d3d9-Supply-the-MSVC-CRT-pieces-a-mingw-CRT-i686-lin.patch
+new file mode 100644
+index 0000000..25e1e18
+--- /dev/null
++++ b/patches/mtld3d/0007-d3d9-Supply-the-MSVC-CRT-pieces-a-mingw-CRT-i686-lin.patch
+@@ -0,0 +1,123 @@
++From 81bae2a7c53c5081405f4f03ccf23e867bd49dd3 Mon Sep 17 00:00:00 2001
++From: Alchemac <noreply@alchemac.invalid>
++Date: Mon, 16 Nov 2026 01:12:23 +0900
++Subject: [PATCH] d3d9: Supply the MSVC CRT pieces a mingw-CRT i686 link needs
++
++The ARM64X halves link llvm-mingw's CRT, and arm64_crt.rs supplies what
++MSVC's static CRT would otherwise define. Build the same way for i686
++(no MSVC CRT, so no xwin and no Microsoft licence) by compiling this
++module, renamed mingw_crt.rs, under --cfg mtld3d_mingw_crt as well. Only
++a build that passes that cfg is affected; the upstream MSVC i686 build
++is unchanged.
++
++For x86 the module adds __fltused and the absolute __tls_array symbol
++(0x2C, the TEB's ThreadLocalStoragePointer offset). __aulldiv, __aullrem
++and __chkstk are left to the link, which imports them from ntdll.dll;
++the type_info vtable and snmalloc's thread-exit TLS callback are shared
++with the ARM64 targets. The cfg is declared in build.rs.
++---
++ windows/d3d9/build.rs                         |  4 +++
++ windows/d3d9/src/lib.rs                       | 10 +++---
++ .../d3d9/src/{arm64_crt.rs => mingw_crt.rs}   | 31 +++++++++++++++++--
++ 3 files changed, 37 insertions(+), 8 deletions(-)
++ rename windows/d3d9/src/{arm64_crt.rs => mingw_crt.rs} (71%)
++
++diff --git a/windows/d3d9/build.rs b/windows/d3d9/build.rs
++index 07520da..e72dd38 100644
++--- a/windows/d3d9/build.rs
+++++ b/windows/d3d9/build.rs
++@@ -21,6 +21,10 @@ fn main() {
++         println!("cargo:rustc-cfg=mtld3d_crumb");
++     }
++ 
+++    // Set by RUSTFLAGS (`--cfg mtld3d_mingw_crt`) for a build that links
+++    // llvm-mingw's CRT instead of MSVC's; see `src/mingw_crt.rs`.
+++    println!("cargo::rustc-check-cfg=cfg(mtld3d_mingw_crt)");
+++
++     println!("cargo::rustc-check-cfg=cfg(perf_tracking)");
++     println!("cargo:rerun-if-env-changed=MTLD3D_PERF");
++     if std::env::var("MTLD3D_PERF").is_ok_and(|v| !v.is_empty() && v != "0") {
++diff --git a/windows/d3d9/src/lib.rs b/windows/d3d9/src/lib.rs
++index 9c71f0b..f9a10c2 100644
++--- a/windows/d3d9/src/lib.rs
+++++ b/windows/d3d9/src/lib.rs
++@@ -1,5 +1,5 @@
++-#[cfg(any(target_arch = "aarch64", target_arch = "arm64ec"))]
++-mod arm64_crt;
+++#[cfg(any(target_arch = "aarch64", target_arch = "arm64ec", mtld3d_mingw_crt))]
+++mod mingw_crt;
++ mod bound_buffers;
++ mod bound_rt;
++ mod capture;
++@@ -58,7 +58,7 @@ use crate::{direct3d9::Direct3D9, unix_call::unix_call};
++ const DLL_PROCESS_ATTACH: u32 = 1;
++ const DLL_PROCESS_DETACH: u32 = 0;
++ /// The reason a thread's exit gives a TLS callback, which only the ARM64X halves install.
++-#[cfg(any(target_arch = "aarch64", target_arch = "arm64ec"))]
+++#[cfg(any(target_arch = "aarch64", target_arch = "arm64ec", mtld3d_mingw_crt))]
++ const DLL_THREAD_DETACH: u32 = 3;
++ 
++ /// Single source of truth for the `log` crate target, so callers don't hard-code the string.
++@@ -151,8 +151,8 @@ pub extern "system" fn dll_main(instance: *mut c_void, reason: u32, _reserved: *
++     if reason != DLL_PROCESS_ATTACH {
++         return 1;
++     }
++-    #[cfg(any(target_arch = "aarch64", target_arch = "arm64ec"))]
++-    arm64_crt::attach();
+++    #[cfg(any(target_arch = "aarch64", target_arch = "arm64ec", mtld3d_mingw_crt))]
+++    mingw_crt::attach();
++     init_logger(instance);
++     attach_process(instance);
++     1
++diff --git a/windows/d3d9/src/arm64_crt.rs b/windows/d3d9/src/mingw_crt.rs
++similarity index 71%
++rename from windows/d3d9/src/arm64_crt.rs
++rename to windows/d3d9/src/mingw_crt.rs
++index 99242c7..8fd15e4 100644
++--- a/windows/d3d9/src/arm64_crt.rs
+++++ b/windows/d3d9/src/mingw_crt.rs
++@@ -1,9 +1,18 @@
++-//! What MSVC's static CRT supplies that the ARM64X link has no library for.
+++//! What MSVC's static CRT supplies that a link against llvm-mingw's CRT has no library for.
++ //!
++-//! The i386 and `x86_64` DLLs link MSVC's `msvcrt.lib`, whose static part defines
+++//! The upstream i386 and `x86_64` DLLs link MSVC's `msvcrt.lib`, whose static part defines
++ //! everything below. The two ARM64X halves link llvm-mingw's CRT instead (see
++ //! `windows-arm64x` in the Makefile), which defines none of it, and MSVC's
++-//! ARM64 and ARM64EC libraries are not available to this build.
+++//! ARM64 and ARM64EC libraries are not available to this build. An i686 DLL
+++//! linked the same way (no MSVC CRT, no Microsoft licence) is built with
+++//! `--cfg mtld3d_mingw_crt`; the upstream MSVC i686 build never sets it and is
+++//! unchanged. This module is compiled for the ARM64 targets and under that cfg.
+++//!
+++//! The i686 link additionally needs `__aulldiv`, `__aullrem` and `__chkstk`,
+++//! which are not defined here: the link takes them from an import library for
+++//! `ntdll.dll` (Wine's i386 ntdll exports `_aulldiv`, `_aullrem` and `_chkstk`
+++//! with the MSVC calling conventions), made with `llvm-dlltool` from a three
+++//! line `.def`.
++ 
++ use core::ffi::c_void;
++ 
++@@ -79,3 +88,19 @@ extern "system" fn on_tls_event(_module: *mut c_void, reason: u32, _reserved: *m
++         unsafe { _malloc_thread_cleanup() };
++     }
++ }
+++
+++/// MSVC's marker that a floating-point object was linked; it only has to exist.
+++///
+++/// `export_name` is the C name: on i686 the object file gets the usual leading
+++/// underscore, so the symbol objects reference is `__fltused`.
+++#[cfg(target_arch = "x86")]
+++#[unsafe(export_name = "_fltused")]
+++pub static FLTUSED: i32 = 0;
+++
+++// MSVC's thread-local storage reads the TLS array through the TEB:
+++// `mov eax, fs:[__tls_array]`. The symbol is an absolute one, the offset of
+++// `ThreadLocalStoragePointer` in the 32-bit TEB (0x2C), which `msvcrt.lib`
+++// defines and llvm-mingw's CRT does not. Assembly names are literal, so this
+++// is spelt as the objects reference it (`__tls_array`, no extra decoration).
+++#[cfg(target_arch = "x86")]
+++core::arch::global_asm!(".globl __tls_array", ".set __tls_array, 0x2C");
++-- 
++2.54.0 (Apple Git-157)
++
 diff --git a/scripts/prefix-init.sh b/scripts/prefix-init.sh
 new file mode 100644
 index 0000000..6e6dad4

@@ -17,6 +17,19 @@ Alchemac runs on the Hadron runtime, release 0.3.0
   `nls/locale.nls` listed an empty era name for the Korean calendar, where Windows returns
   the Dangi era name. Delphi-built programs crash at startup in a Korean locale because of
   it. The script inserts the name (16 bytes) and checks the result by re-parsing the file.
+- `patches/mtld3d/0004-…` to `0006-…`: three fixes to mtld3d's Direct3D 9 layer that
+  WPF hardware rendering needs: reading back a render target or back buffer through
+  `GetDC` when it is not lockable, keeping an additional swap chain's back buffer alive
+  while the application still holds it, and renaming a contended staging resource before
+  `UpdateSurface` and fill writes.
+- `patches/mtld3d/0007-…`: lets the 32-bit (i686) `d3d9.dll` link against llvm-mingw's CRT
+  instead of the MSVC CRT (no MSVC libraries or xwin needed), as the ARM64X one already does:
+  it supplies the CRT pieces MSVC would (`__fltused`, `__tls_array`, the `type_info` vtable,
+  the thread-exit TLS callback) under `--cfg mtld3d_mingw_crt`; the upstream MSVC build is
+  unchanged. Only the native `d3d9.dll` files change. Build both without a Wine tree with
+  `tools/runtime/build-mtld3d-d3d9.sh` and put them into a runtime with
+  `tools/runtime/patch-mtld3d-d3d9.py [--i386 <i386-d3d9.dll>] <runtime> <new-runtime> d3d9.dll <patch>...`
+  (`mtld3d.dll` and `mtld3d.so` are not rebuilt).
 
 Apply with `git -C hadron apply alchemac-hadron.patch`, then build the runtime as Hadron
 documents. Hadron and each component keep their own licenses.

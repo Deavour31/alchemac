@@ -80,13 +80,24 @@ the DMG). It needs Xcode command line tools, an llvm-mingw toolchain for the
 small Windows helper, and a Hadron runtime built from Hadron 0.3.0
 (commit `2faae2af7dbcd0b6448bea5c86c20c33548a792c`) with the patches in
 `hadron/`, then patched with `tools/runtime/patch-locale-nls.py <runtime> <new-runtime>`
-(Korean calendar era name in Wine's locale data). See `hadron/README.md`. Place `wine-mono-11.3.0-x86.msi` (from
+(Korean calendar era name in Wine's locale data). mtld3d's native `d3d9.dll` files (ARM64X and 32-bit) are rebuilt with the
+patches `hadron/patches/mtld3d/0004-…`–`0006-…` (fixes needed by WPF hardware rendering) and `0007-…` (links the 32-bit one against llvm-mingw's CRT instead of the MSVC CRT) using
+`tools/runtime/build-mtld3d-d3d9.sh` (no Wine tree needed) and installed with
+`tools/runtime/patch-mtld3d-d3d9.py [--i386 <i386-d3d9.dll>] <runtime> <new-runtime> d3d9.dll <patch>...`. See `hadron/README.md`. Place `wine-mono-11.3.0-x86.msi` (from
 https://dl.winehq.org/wine/wine-mono/11.3.0/) and its `COPYING` in `work/wine-mono/`.
 
 Before every launch the Windows helper (`prefix-profile.c`) prepares the environment's prefix:
 Korean font fallbacks (GDI substitutes/links and DirectWrite replacements, only where
-the font is absent and no entry exists) and WPF software rendering
-(`Avalon.Graphics\DisableHWAcceleration=1`, kept if already set).
+the font is absent and no entry exists). WPF hardware rendering is on by default again: 0.5.7 set
+`Avalon.Graphics\DisableHWAcceleration=1`, and the helper removes that value once per environment
+(marker `HKCU\Software\Alchemac\WpfHardwareRestored`) if it is still 1; a value set later is kept.
+
+If the environment has no `Internet Settings\Connections\DefaultConnectionSettings` value, the helper writes a direct-connection one (proxy auto-detect off). Wine derives the WPAD host from the Mac's `<name>.local` host name, and on some networks `wpad.local` accepts the connection but never answers, which stalls the first .NET/WinHTTP request for 60 s; Windows does not search WPAD under `.local`. An existing value, such as a proxy the user configured, is left alone.
+
+A Wine environment receives mtld3d's `d3d9.dll` only when it is created. Before a launch the app
+(`refreshD3D9` in `Runtime.swift`) replaces that file in an existing, complete environment with the
+runtime's when it differs. Only a file that is already mtld3d's is replaced; Wine's builtin, a file a
+user put there, or an absent file is never touched. Failures are logged and do not stop the launch.
 
 ## License
 

@@ -142,18 +142,53 @@ static void link_korean_ui(void) {
     printf("prefix-profile: Korean UI font fallback updated (%u entries)\n", changed);
 }
 
-/* WPF renders through Direct3D 9 hardware acceleration, which crashes or redraws only
- * part of a window on the translated graphics stack. Its software renderer is reliable
- * and only affects WPF. Written once so an environment that sets it either way keeps it. */
-static void default_wpf_software(void) {
+/* Alchemac 0.5.7 turned WPF hardware rendering off by default (Avalon.Graphics
+ * DisableHWAcceleration=1) because of mtld3d bugs that are fixed now. Once per
+ * environment that value is removed if it is still 1; a later choice is kept. */
+static void restore_wpf_hardware(void) {
     HKEY key;
-    DWORD value = 1, size = sizeof(value), type;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Avalon.Graphics",
+    DWORD done = 0, size = sizeof(done), type;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Alchemac",
             0, NULL, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS) return;
-    DWORD existing;
-    if (RegQueryValueExW(key, L"DisableHWAcceleration", NULL, &type, (BYTE *)&existing, &size) != ERROR_SUCCESS
-            && RegSetValueExW(key, L"DisableHWAcceleration", 0, REG_DWORD, (const BYTE *)&value, sizeof(value)) == ERROR_SUCCESS)
-        printf("prefix-profile: WPF software rendering enabled\n");
+    if (RegQueryValueExW(key, L"WpfHardwareRestored", NULL, &type, (BYTE *)&done, &size) == ERROR_SUCCESS) {
+        RegCloseKey(key);
+        return;
+    }
+    RegCloseKey(key);
+    HKEY avalon;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Avalon.Graphics", 0,
+            KEY_QUERY_VALUE | KEY_SET_VALUE, &avalon) == ERROR_SUCCESS) {
+        DWORD existing = 0; size = sizeof(existing);
+        if (RegQueryValueExW(avalon, L"DisableHWAcceleration", NULL, &type, (BYTE *)&existing, &size) == ERROR_SUCCESS
+                && type == REG_DWORD && existing == 1
+                && RegDeleteValueW(avalon, L"DisableHWAcceleration") == ERROR_SUCCESS)
+            printf("prefix-profile: WPF hardware rendering restored\n");
+        RegCloseKey(avalon);
+    }
+    DWORD marker = 1;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Alchemac", 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(key, L"WpfHardwareRestored", 0, REG_DWORD, (const BYTE *)&marker, sizeof(marker));
+        RegCloseKey(key);
+    }
+}
+
+/* Wine's WinHTTP proxy auto-detect asks DNS for wpad.<domain>, and the domain comes from
+ * the Mac's host name (<name>.local). On some networks wpad.local resolves to a host that
+ * accepts the connection but never answers, so every first request waits 60 s. Windows
+ * does not search WPAD under .local. Unless a connection setting already exists (a proxy
+ * the user configured is never touched), write a direct-connection value without
+ * PROXY_AUTODETECT_SETTINGS: DWORD 0x46, counter 2, flags 1, then 44 zero bytes. */
+static void default_direct_connection(void) {
+    HKEY key;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\Connections",
+            0, NULL, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS) return;
+    if (RegQueryValueExW(key, L"DefaultConnectionSettings", NULL, NULL, NULL, NULL) == ERROR_FILE_NOT_FOUND) {
+        BYTE settings[56] = {0};
+        DWORD header[3] = {0x46, 2, 1};
+        memcpy(settings, header, sizeof(header));
+        if (RegSetValueExW(key, L"DefaultConnectionSettings", 0, REG_BINARY, settings, sizeof(settings)) == ERROR_SUCCESS)
+            printf("prefix-profile: proxy auto-detect off (direct connection)\n");
+    }
     RegCloseKey(key);
 }
 
@@ -253,7 +288,8 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (install_font(argv[2])) return 1;
     link_korean_ui();
-    default_wpf_software();
+    restore_wpf_hardware();
+    default_direct_connection();
     if (!wcscmp(argv[1], L"--check")) return 0;
     if (!wcscmp(argv[1], L"--command")) {
         /* A registered Windows command line, such as an UninstallString, parsed by

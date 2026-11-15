@@ -344,6 +344,51 @@ struct SelfTests {
         try check(fm.fileExists(atPath: game.appendingPathComponent("GameLauncher.exe").path), "unregister does not delete game data")
         try fm.createSymbolicLink(atPath: game.appendingPathComponent("redirected").path, withDestinationPath: "/etc")
         try rejects("owned-path link rejected") { try store.requireLocal(game.appendingPathComponent("redirected/hosts")) }
+        // d3d9.dll refresh of an existing prefix
+        let d3dRuntime = temp.appendingPathComponent("d3d-runtime")
+        for arch in ["aarch64", "i386"] {
+            try fm.createDirectory(at: d3dRuntime.appendingPathComponent("dist/lib/hadron/d3d9/" + arch), withIntermediateDirectories: true)
+            try Data("MZ mtld3d new \(arch)".utf8).write(to: d3dRuntime.appendingPathComponent("dist/lib/hadron/d3d9/\(arch)/d3d9.dll"))
+        }
+        func d3dPrefix(_ name: String, ready: Bool = true, incomplete: Bool = false, system32: String?, syswow64: String? = nil) throws -> URL {
+            let prefix = temp.appendingPathComponent(name)
+            for (folder, text) in [("system32", system32), ("syswow64", syswow64)] {
+                let dir = prefix.appendingPathComponent("drive_c/windows/" + folder)
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                if let text { try Data(text.utf8).write(to: dir.appendingPathComponent("d3d9.dll")) }
+            }
+            if ready { try Data("id\n".utf8).write(to: prefix.appendingPathComponent(".hadron-prefix-ready")) }
+            if incomplete { try Data().write(to: prefix.appendingPathComponent(".hadron-migration-incomplete")) }
+            return prefix
+        }
+        func d3dFile(_ prefix: URL, _ folder: String) -> String? {
+            (try? String(contentsOf: prefix.appendingPathComponent("drive_c/windows/" + folder + "/d3d9.dll"), encoding: .utf8))
+        }
+        let d3dOld = try d3dPrefix("d3d-old", system32: "MZ mtld3d old", syswow64: "MZ mtld3d old32")
+        AlchemacRuntime.refreshD3D9(prefix: d3dOld, runtime: d3dRuntime)
+        try check(d3dFile(d3dOld, "system32") == "MZ mtld3d new aarch64" && d3dFile(d3dOld, "syswow64") == "MZ mtld3d new i386",
+                  "d3d9 refresh replaces a differing mtld3d file")
+        try check(try fm.contentsOfDirectory(atPath: d3dOld.appendingPathComponent("drive_c/windows/system32").path) == ["d3d9.dll"],
+                  "d3d9 refresh leaves no temporary file")
+        let d3dForeign = try d3dPrefix("d3d-foreign", system32: "MZ wine builtin", syswow64: "MZ user file")
+        AlchemacRuntime.refreshD3D9(prefix: d3dForeign, runtime: d3dRuntime)
+        try check(d3dFile(d3dForeign, "system32") == "MZ wine builtin" && d3dFile(d3dForeign, "syswow64") == "MZ user file",
+                  "d3d9 refresh leaves a file without the mtld3d marker alone")
+        let d3dEmpty = try d3dPrefix("d3d-empty", system32: nil)
+        AlchemacRuntime.refreshD3D9(prefix: d3dEmpty, runtime: d3dRuntime)
+        try check(d3dFile(d3dEmpty, "system32") == nil && d3dFile(d3dEmpty, "syswow64") == nil, "d3d9 refresh does not create a missing file")
+        let d3dSame = try d3dPrefix("d3d-same", system32: "MZ mtld3d new aarch64")
+        let d3dSameFile = d3dSame.appendingPathComponent("drive_c/windows/system32/d3d9.dll")
+        let inodeBefore = try fm.attributesOfItem(atPath: d3dSameFile.path)[.systemFileNumber] as? Int
+        AlchemacRuntime.refreshD3D9(prefix: d3dSame, runtime: d3dRuntime)
+        try check(inodeBefore != nil && (try fm.attributesOfItem(atPath: d3dSameFile.path)[.systemFileNumber] as? Int) == inodeBefore,
+                  "d3d9 refresh leaves an identical file untouched")
+        let d3dBusy = try d3dPrefix("d3d-incomplete", incomplete: true, system32: "MZ mtld3d old")
+        let d3dFresh = try d3dPrefix("d3d-notready", ready: false, system32: "MZ mtld3d old")
+        AlchemacRuntime.refreshD3D9(prefix: d3dBusy, runtime: d3dRuntime)
+        AlchemacRuntime.refreshD3D9(prefix: d3dFresh, runtime: d3dRuntime)
+        try check(d3dFile(d3dBusy, "system32") == "MZ mtld3d old" && d3dFile(d3dFresh, "system32") == "MZ mtld3d old",
+                  "d3d9 refresh skips an incomplete or unprepared prefix")
         print("RESULT: \(passed) checks passed")
     }
 }
