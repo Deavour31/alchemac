@@ -895,6 +895,118 @@ index 0000000..25e1e18
 +-- 
 +2.54.0 (Apple Git-157)
 +
+diff --git a/patches/wine/0030-win32u-Reparent-a-window-a-CBT-hook-turns-into-a-chi.patch b/patches/wine/0030-win32u-Reparent-a-window-a-CBT-hook-turns-into-a-chi.patch
+new file mode 100644
+index 0000000..43f389e
+--- /dev/null
++++ b/patches/wine/0030-win32u-Reparent-a-window-a-CBT-hook-turns-into-a-chi.patch
+@@ -0,0 +1,106 @@
++From 7511415c7e40529a3fe4bd06978b0cb93ffb9324 Mon Sep 17 00:00:00 2001
++From: Alchemac <noreply@alchemac.invalid>
++Date: Mon, 16 Nov 2026 22:46:57 +0900
++Subject: [PATCH] win32u: Reparent a window a CBT hook turns into a child.
++
++When a window is created with a parent but without WS_CHILD, the parent becomes its owner and the window is created as a top-level window. A WH_CBT hook can still change the style in HCBT_CREATEWND, either with SetWindowLong(GWL_STYLE) or through CREATESTRUCT.style, and on Windows a window turned into WS_CHILD that way ends up as a real child of that parent. MFC dialogs do exactly this (a WS_POPUP dialog owned by another dialog is made a child in the CBT hook, and the dialog then positions itself with parent client coordinates).
++
++Wine decided on the parent before the hook ran and never looked at it again, so such a window stayed a top-level window with WS_CHILD set, and the client/screen coordinates the application computed were wrong.
++
++After the hook returns, make the window a child of the hook's CREATESTRUCT.hwndParent if that is a valid window, otherwise of the original owner, clear the owner and keep the local parent/owner state, so the remaining creation steps (coordinates, DPI mapping, WM_NCCREATE, the control ID) treat it as a normal child. The window is not visible yet, so only the server-side window links change and no messages are sent. Every other case is unchanged.
++---
++ dlls/win32u/window.c | 71 ++++++++++++++++++++++++++++++++++++++++++++
++ 1 file changed, 71 insertions(+)
++
++diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
++index 8ddc40fb17..c2a3915578 100644
++--- a/dlls/win32u/window.c
+++++ b/dlls/win32u/window.c
++@@ -5871,6 +5871,65 @@ static void map_dpi_create_struct( CREATESTRUCTW *cs, struct ratio dpi_to )
++     cs->cy = rect.bottom - rect.top;
++ }
++ 
+++/* A WH_CBT hook may turn a window that was created as an owned top-level (WS_POPUP, or
+++ * neither WS_POPUP nor WS_CHILD, with a parent window passed to CreateWindow) into a child
+++ * window by changing its style in HCBT_CREATEWND, either with SetWindowLong() or through
+++ * CREATESTRUCT.style. MFC dialogs do this. Windows then creates a real child of the former
+++ * owner; do the same, and return the new parent (0 if the window is left alone). */
+++static HWND reparent_cbt_child( HWND hwnd, HWND owner, CREATESTRUCTW *cs )
+++{
+++    HWND new_parent, old_parent = 0;
+++    BOOL is_child_style, ret = FALSE;
+++    WND *win;
+++
+++    if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS || win == WND_DESKTOP) return 0;
+++    is_child_style = (win->dwStyle & (WS_CHILD | WS_POPUP)) == WS_CHILD ||
+++                     (cs->style & (WS_CHILD | WS_POPUP)) == WS_CHILD;
+++    release_win_ptr( win );
+++    if (!is_child_style) return 0;
+++
+++    /* prefer a parent chosen by the hook, otherwise the owner the window was created with */
+++    new_parent = cs->hwndParent && cs->hwndParent != HWND_MESSAGE ? get_full_window_handle( cs->hwndParent ) : 0;
+++    if (!new_parent || new_parent == hwnd || new_parent == get_desktop_window() ||
+++        !is_window( new_parent ) || is_child( hwnd, new_parent ))
+++        new_parent = get_full_window_handle( owner );
+++    if (!new_parent || new_parent == hwnd || !is_window( new_parent )) return 0;
+++
+++    if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS || win == WND_DESKTOP) return 0;
+++
+++    /* The window is not visible yet, so unlike NtUserSetParent() there is nothing to hide, move
+++     * or notify: only the server side links need to change. */
+++    SERVER_START_REQ( set_parent )
+++    {
+++        req->handle = wine_server_user_handle( hwnd );
+++        req->parent = wine_server_user_handle( new_parent );
+++        if ((ret = !wine_server_call( req )))
+++        {
+++            old_parent = wine_server_ptr_handle( reply->old_parent );
+++            win->parent = wine_server_ptr_handle( reply->full_parent );
+++        }
+++    }
+++    SERVER_END_REQ;
+++    if (ret)
+++    {
+++        SERVER_START_REQ( set_window_owner )
+++        {
+++            req->handle = wine_server_user_handle( hwnd );
+++            req->owner  = 0;
+++            if (!wine_server_call( req )) win->owner = 0;
+++        }
+++        SERVER_END_REQ;
+++
+++        /* make the styles agree that this is now a child */
+++        win->dwStyle = (win->dwStyle & ~WS_POPUP) | WS_CHILD;
+++        cs->style    = (cs->style & ~WS_POPUP) | WS_CHILD;
+++    }
+++    release_win_ptr( win );
+++
+++    TRACE( "hwnd %p reparented from %p to %p by the CBT hook\n", hwnd, old_parent, new_parent );
+++    return ret ? new_parent : 0;
+++}
+++
++ /***********************************************************************
++  *           NtUserCreateWindowEx (win32u.@)
++  */
++@@ -5999,6 +6058,18 @@ HWND WINAPI NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *class_name,
++         free_window_handle( hwnd );
++         return 0;
++     }
+++
+++    if (owner && parent == get_desktop_window())
+++    {
+++        HWND new_parent = reparent_cbt_child( hwnd, owner, &cs );
+++        if (new_parent)
+++        {
+++            /* from here on it is a normal child: cs.x/cs.y are relative to the new parent */
+++            cs.hwndParent = parent = new_parent;
+++            owner = 0;
+++        }
+++    }
+++
++     if (!(win = get_win_ptr( hwnd ))) return 0;
++ 
++     /*
++-- 
++2.54.0 (Apple Git-157)
++
 diff --git a/scripts/prefix-init.sh b/scripts/prefix-init.sh
 new file mode 100644
 index 0000000..6e6dad4

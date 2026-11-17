@@ -30,9 +30,10 @@ FILES = {
     'tools/runtime/patch-locale-nls.py': 'tools/runtime/patch-locale-nls.py',
     'tools/runtime/build-mtld3d-d3d9.sh': 'tools/runtime/build-mtld3d-d3d9.sh',
     'tools/runtime/patch-mtld3d-d3d9.py': 'tools/runtime/patch-mtld3d-d3d9.py',
+    'tools/runtime/patch-wine-unix-lib.py': 'tools/runtime/patch-wine-unix-lib.py',
 }
 APP_SOURCES = ['main.swift', 'App.swift', 'Runtime.swift', 'SessionController.swift', 'Profile.swift',
-               'InputSource.swift', 'Addon.swift', 'prefix-profile.c', 'session-attach', 'README.md', 'LICENSE']
+               'InputSource.swift', 'Addon.swift', 'ExeIcon.swift', 'Maintenance.swift', 'prefix-profile.c', 'session-attach', 'README.md', 'LICENSE']
 
 HADRON_README = f"""# Hadron changes
 
@@ -66,6 +67,12 @@ Alchemac runs on the Hadron runtime, release 0.3.0
   `tools/runtime/build-mtld3d-d3d9.sh` and put them into a runtime with
   `tools/runtime/patch-mtld3d-d3d9.py [--i386 <i386-d3d9.dll>] <runtime> <new-runtime> d3d9.dll <patch>...`
   (`mtld3d.dll` and `mtld3d.so` are not rebuilt).
+- `patches/wine/0030-…`: Wine's `win32u` now makes a window a real child of its parent when a
+  `WH_CBT` hook turns an owned top-level window into a child while it is being created
+  (as MFC dialogs do), like Windows. Before, the window stayed top-level with `WS_CHILD` set and
+  the coordinates the program computed were wrong, so nested dialogs collapsed or were
+  misplaced. Rebuild `win32u.so` from the Wine tree and put it into a runtime with
+  `tools/runtime/patch-wine-unix-lib.py <runtime> <new-runtime> win32u.so <patch>...`.
 
 Apply with `git -C hadron apply alchemac-hadron.patch`, then build the runtime as Hadron
 documents. Hadron and each component keep their own licenses.

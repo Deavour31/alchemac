@@ -8,6 +8,8 @@ final class LibraryModel: ObservableObject {
     @Published var registry: Registry
     @Published var importing = false
     @Published var importMessage = ""
+    /// Programs' own icons, filled in after extraction; the list shows a symbol until then.
+    @Published var icons: [String: NSImage] = [:]
 
     /// Environment names for the Wine environment menu, "" first for the shared one.
     @Published var environmentNames: [String] = [""]
@@ -15,6 +17,11 @@ final class LibraryModel: ObservableObject {
     @Published var retina: [String: Bool] = [:]
 
     init(store: LauncherStore) throws { self.store = store; registry = try store.read(); refreshRetina(); refreshAddons() }
+    func loadIcon(_ launcher: Launcher) async {
+        guard icons[launcher.id] == nil, let exe = try? store.executable(launcher), let dir = try? store.directory(launcher) else { return }
+        let png = await Task.detached(priority: .utility) { ExeIcon.cachedPNG(exe: exe, dir: dir) }.value
+        if let png, let image = NSImage(data: png) { icons[launcher.id] = image }
+    }
     func refreshRetina() {
         environmentNames = [""] + store.environments()
         var states: [String: Bool] = [:]
@@ -98,6 +105,8 @@ final class LibraryModel: ObservableObject {
         if let running = session.session(in: store.prefix(environment: name)) {
             self.error(AlchemacError.message("이 환경에서 ‘\(running.title)’이(가) 실행 중입니다. 세션을 먼저 종료해 주세요.")); return
         }
+        let prefix = store.prefix(environment: name)
+        if PrefixMigration.isEnvironmentBusy(prefix) { self.error(OrphanSession(prefix: prefix)); return }
         do {
             let folders = try store.environmentFolders(name)
             let alert = NSAlert(); alert.alertStyle = .warning
@@ -107,12 +116,13 @@ final class LibraryModel: ObservableObject {
             guard alert.runModal() == .alertFirstButtonReturn else { return }
             importing = true; importMessage = "휴지통으로 옮기는 중입니다…"
             DispatchQueue.global(qos: .userInitiated).async {
-                let result = Result { try folders.forEach { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) } }
+                // Under the session lock: a supervisor started after the check above makes this fail instead of pulling the folder away.
+                let result = Result { try PrefixMigration.withEnvironmentFree(prefix) { try folders.forEach { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) } } }
                 DispatchQueue.main.async {
                     self.importing = false; self.refreshRetina()
                     switch result {
-                    case .success: self.importMessage = "전용 Wine 환경 ‘\(name)’을(를) 휴지통으로 옮겼습니다."
-                    case .failure(let error): self.importMessage = "삭제하지 못했습니다."; self.error(error)
+                    case .success: self.session.message = "전용 Wine 환경 ‘\(name)’을(를) 휴지통으로 옮겼습니다."
+                    case .failure(let error): self.session.message = "삭제하지 못했습니다."; self.error(error)
                     }
                 }
             }
@@ -128,16 +138,182 @@ final class LibraryModel: ObservableObject {
     var selected: Launcher? { registry.launchers.first { $0.id == registry.selectedID } }
 
     func error(_ error: Error) {
+        if let interrupted = error as? MigrationInterrupted { recoverMigration(interrupted.prefix, retry: nil); return }
+        if let orphan = error as? OrphanSession { offerOrphanStop([(environmentTitle(orphan.prefix), orphan.prefix)], startup: false); return }
         let alert = NSAlert(); alert.messageText = "작업을 완료하지 못했습니다"
         alert.informativeText = error.localizedDescription; alert.runModal()
     }
+    /// Offered when a runtime migration of a Wine environment was interrupted and its marker blocks every launch.
+    /// `retry` starts the program again after "다시 시도". Synchronous: the restore is an APFS clone and two renames.
+    func recoverMigration(_ prefix: URL, retry: (() -> Void)?) {
+        let alert = NSAlert(); alert.alertStyle = .warning
+        alert.messageText = "이 Wine 환경의 업데이트가 중간에 멈췄습니다"
+        alert.informativeText = "앱을 업데이트한 뒤 첫 실행에서 Wine 환경을 새 버전에 맞추는 작업이 끝나기 전에 중단돼 환경이 잠겨 있습니다. ‘다시 시도’는 작업을 처음부터 다시 하고, ‘업데이트 전 상태로 복원’은 작업 직전에 만들어 둔 백업으로 환경을 되돌립니다."
+        alert.addButton(withTitle: "다시 시도"); alert.addButton(withTitle: "업데이트 전 상태로 복원"); alert.addButton(withTitle: "취소")
+        let choice = alert.runModal()
+        guard choice == .alertFirstButtonReturn || choice == .alertSecondButtonReturn else { return }
+        func fail(_ text: String) {
+            let failed = NSAlert(); failed.alertStyle = .warning; failed.messageText = "작업을 완료하지 못했습니다"; failed.informativeText = text; failed.runModal()
+        }
+        guard session.session(in: prefix) == nil else { return fail("이 환경을 쓰는 프로그램이 실행 중입니다. 먼저 종료해 주세요.") }
+        if choice == .alertFirstButtonReturn {
+            do { try PrefixMigration.clearMarker(prefix) } catch { if error is OrphanSession { self.error(error); return }; return fail(error.localizedDescription) }
+            if let retry { retry() } else { session.message = "업데이트 잠금을 풀었습니다. 프로그램을 다시 실행해 주세요." }
+            return
+        }
+        guard let snapshot = PrefixMigration.snapshot(for: prefix, store: store) else {
+            return fail("기록된 백업 폴더를 복원에 쓸 수 없습니다. 백업이 없어졌거나 이 환경의 백업이 아닙니다. 아무것도 바꾸지 않았습니다. ‘다시 시도’를 고르거나, 환경 폴더 옆의 ‘.backup.’ 폴더를 확인해 주세요.")
+        }
+        let confirm = NSAlert(); confirm.alertStyle = .warning; confirm.messageText = "업데이트 전 상태로 복원할까요?"
+        confirm.informativeText = "지금 환경은 휴지통으로 옮기고, 백업 ‘\(snapshot.lastPathComponent)’을(를) 복사해 그 자리에 둡니다. 백업 폴더는 그대로 남습니다."
+        confirm.addButton(withTitle: "복원"); confirm.addButton(withTitle: "취소")
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+        do {
+            try PrefixMigration.restore(prefix, from: snapshot)
+            session.message = "업데이트 전 상태로 복원했습니다. 다시 실행하면 새 버전에 맞추는 작업을 처음부터 다시 합니다."
+        } catch { if error is OrphanSession { self.error(error) } else { fail(error.localizedDescription) } }
+    }
+    /// Tells the user once what `LauncherStore.read()` repaired; called after the window is up.
+    func showRecoveryNotice() {
+        guard let text = store.recoveryNotice else { return }
+        let alert = NSAlert(); alert.alertStyle = .informational; alert.messageText = "프로그램 목록을 복구했습니다"
+        alert.informativeText = text; alert.runModal()
+    }
+    // MARK: Sessions an earlier run of the app left behind
+
+    func environmentTitle(_ prefix: URL) -> String {
+        store.knownEnvironments(registry).first { $0.prefix.standardizedFileURL == prefix.standardizedFileURL }?.title ?? prefix.lastPathComponent
+    }
+    /// Environments whose session lock is held although this run of the app has no session there.
+    func orphanedEnvironments() -> [(title: String, prefix: URL)] {
+        store.knownEnvironments(registry).filter { session.session(in: $0.prefix) == nil && PrefixMigration.isEnvironmentBusy($0.prefix) }
+    }
+    /// At launch (`startup`) only speaks up when something is left; the menu item also says when nothing is.
+    func checkOrphans(startup: Bool) {
+        let found = orphanedEnvironments()
+        if !found.isEmpty { offerOrphanStop(found, startup: startup); return }
+        guard !startup else { return }
+        let alert = NSAlert(); alert.alertStyle = .informational; alert.messageText = "남은 세션이 없습니다"
+        alert.informativeText = "이전에 시작한 Wine 세션이 이 환경들을 쓰고 있지 않습니다."; alert.runModal()
+    }
+    func offerOrphanStop(_ found: [(title: String, prefix: URL)], startup: Bool) {
+        let alert = NSAlert(); alert.alertStyle = .warning
+        alert.messageText = "이전에 시작한 세션이 아직 실행 중입니다"
+        alert.informativeText = "Alchemac이 예기치 않게 종료됐지만 Wine 세션이 남아 있습니다. 그동안 이 환경에서는 프로그램 실행, 삭제, 설정 변경을 할 수 없습니다.\n"
+            + found.map { "• " + $0.title }.joined(separator: "\n")
+            + "\n\n‘남은 세션 종료’는 이 환경에서 실행 중인 Wine 프로그램을 모두 닫습니다. 열려 있는 작업이 있다면 먼저 저장해 주세요."
+        alert.addButton(withTitle: "남은 세션 종료"); alert.addButton(withTitle: startup ? "나중에" : "취소")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        stopOrphans(found)
+    }
+    /// Sends TERM to each verified supervisor, then waits (up to 30 s, without blocking the window) for its lock to be free.
+    func stopOrphans(_ found: [(title: String, prefix: URL)]) {
+        var signaled: [(title: String, prefix: URL)] = [], unverified: [String] = []
+        for item in found where PrefixMigration.isEnvironmentBusy(item.prefix) {
+            if OrphanSessions.terminate(support: store.support, prefix: item.prefix) { signaled.append(item) } else { unverified.append(item.title) }
+        }
+        importing = true; importMessage = "남은 세션을 종료하는 중입니다…"
+        Task {
+            var stuck: [String] = []
+            for item in signaled where !(await OrphanSessions.waitUntilFree(item.prefix)) { stuck.append(item.title) }
+            self.importing = false; self.refreshRetina()
+            var problems: [String] = []
+            if !unverified.isEmpty { problems.append("다음 환경은 남은 세션의 프로세스를 확인하지 못해 아무것도 종료하지 않았습니다. Mac을 다시 시작해 주세요.\n" + unverified.map { "• " + $0 }.joined(separator: "\n")) }
+            if !stuck.isEmpty { problems.append("세션이 아직 끝나지 않았습니다. 잠시 후 다시 시도하거나 Mac을 다시 시작해 주세요.\n" + stuck.map { "• " + $0 }.joined(separator: "\n")) }
+            if problems.isEmpty { self.session.message = "남은 세션을 종료했습니다."; return }
+            self.session.message = "남은 세션을 모두 종료하지 못했습니다."
+            let alert = NSAlert(); alert.alertStyle = .warning; alert.messageText = "남은 세션을 모두 종료하지 못했습니다"
+            alert.informativeText = problems.joined(separator: "\n\n"); alert.runModal()
+        }
+    }
+
+    // MARK: Cleanup of leftovers
+
+    /// Once per launch, in the background. No session starts while it runs (SessionController.maintenance), which
+    /// gives the user a clear message instead of the runtime's busy exit.
+    func startCleanup() {
+        guard !session.maintenance else { return }
+        session.maintenance = true
+        let store = self.store, runtime = AlchemacRuntime.root
+        DispatchQueue.global(qos: .utility).async {
+            let summary = StartupCleanup.run(store: store, runtime: runtime)
+            DispatchQueue.main.async {
+                self.session.maintenance = false
+                if summary.freed > 500_000_000, !self.session.busy { self.session.message = "이전 실행 환경 사본 등 약 \(Self.size(summary.freed))를 정리했습니다." }
+            }
+        }
+    }
+
+    // MARK: Backups
+
+    /// "환경 백업 정리…": keeps the newest snapshot of each environment and moves the others to the Trash.
+    func manageBackups() {
+        let environments = store.knownEnvironments(registry), store = self.store
+        importing = true; importMessage = "환경 백업을 찾는 중입니다…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let found = environments.map { (environment: $0, snapshots: Backups.snapshots(of: $0.prefix)) }.filter { !$0.snapshots.isEmpty }
+            let sizes = found.map { store.allocatedSize($0.snapshots.map(\.url)) }
+            DispatchQueue.main.async { self.importing = false; self.offerBackupCleanup(found, sizes: sizes) }
+        }
+    }
+    private func offerBackupCleanup(_ found: [(environment: (title: String, prefix: URL), snapshots: [Backups.Snapshot])], sizes: [Int64]) {
+        let alert = NSAlert()
+        guard found.contains(where: { $0.snapshots.count > 1 }) else {
+            alert.messageText = "정리할 환경 백업이 없습니다"
+            alert.informativeText = found.isEmpty ? "환경 옆에 업데이트 전 백업(‘.backup.’ 폴더)이 없습니다." : "백업이 환경마다 1개뿐이라 남길 것만 있습니다."
+            alert.runModal(); return
+        }
+        let formatter = DateFormatter(); formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        let lines = zip(found, sizes).map { entry, size -> String in
+            let newest = Backups.newest(entry.snapshots)?.date.map { formatter.string(from: $0) } ?? "날짜 알 수 없음"
+            return "• \(entry.environment.title): 백업 \(entry.snapshots.count)개 · 가장 최근 \(newest) · 합계 약 \(Self.size(size))"
+        }
+        alert.alertStyle = .warning
+        alert.messageText = "환경 백업을 정리할까요?"
+        alert.informativeText = lines.joined(separator: "\n")
+            + "\n\n환경마다 가장 최근 백업 1개만 남기고 나머지는 휴지통으로 옮깁니다. 휴지통에서 되살릴 수 있습니다. 업데이트가 중단된 환경이 복원에 쓸 백업은 항상 남깁니다. 백업은 APFS 복제본이라 공간을 서로 나눠 쓰므로 실제로 비워지는 공간은 더 작을 수 있습니다. 세션이 실행 중인 환경은 건너뜁니다."
+        alert.addButton(withTitle: "가장 최근 백업만 남기기"); alert.addButton(withTitle: "취소")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let environments = found.map(\.environment)
+        importing = true; importMessage = "백업을 휴지통으로 옮기는 중입니다…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            var moved = 0, busy: [String] = [], failed: [String] = []
+            for environment in environments {
+                do {
+                    // Recomputed under the session lock, so the choice matches what is on disk when it is applied.
+                    try PrefixMigration.withEnvironmentFree(environment.prefix) {
+                        for url in Backups.removable(Backups.snapshots(of: environment.prefix), protected: Backups.protected(environment.prefix)) {
+                            try FileManager.default.trashItem(at: url, resultingItemURL: nil); moved += 1
+                        }
+                    }
+                } catch is OrphanSession { busy.append(environment.title) }
+                catch { failed.append(environment.title + " (" + error.localizedDescription + ")") }
+            }
+            let result = (moved, busy, failed)
+            DispatchQueue.main.async {
+                self.importing = false
+                var text = "백업 \(result.0)개를 휴지통으로 옮겼습니다."
+                if !result.1.isEmpty { text += "\n세션이 실행 중이라 건너뜀: " + result.1.joined(separator: ", ") }
+                if !result.2.isEmpty { text += "\n옮기지 못함: " + result.2.joined(separator: ", ") }
+                self.session.message = text
+                if !result.1.isEmpty || !result.2.isEmpty {
+                    let note = NSAlert(); note.alertStyle = .warning; note.messageText = "일부 환경의 백업을 정리하지 못했습니다"; note.informativeText = text; note.runModal()
+                }
+            }
+        }
+    }
+
     func save() { do { try store.write(registry) } catch { self.error(error) } }
     func start() {
         guard let selected else { return }
         // An add-on can ask for an English layout for programs that fail on a Korean one.
         let wantsEnglish = selected.addon.flatMap(store.addon)?.englishInput ?? false
         let switched = wantsEnglish ? EnglishInput.ensure() : nil
-        do { try session.start(selected, store: store) } catch { self.error(error); return }
+        do { try session.start(selected, store: store) }
+        catch let interrupted as MigrationInterrupted {
+            recoverMigration(interrupted.prefix) { [weak self] in self?.start() }
+            return
+        } catch { self.error(error); return }
         if let exe = try? store.executable(selected), let prefix = try? store.prefix(selected), store.needsWineMono(exe, in: prefix) {
             session.message += "\n.NET 실행 환경(Wine Mono)을 처음 한 번 설치합니다. 창이 뜰 때까지 1~2분 걸립니다."
         }
@@ -154,6 +330,9 @@ final class LibraryModel: ObservableObject {
         guard let running = selectedSession else { return }
         let alert = NSAlert(); alert.messageText = "‘\(running.title)’ 세션을 종료할까요?"
         alert.informativeText = "열려 있는 작업이나 게임이 있다면 먼저 저장해 주세요. 같은 Wine 환경에서 이 앱이 시작한 프로그램이 함께 종료되고, 다른 환경의 프로그램은 계속 실행됩니다."
+        if running.migrating {
+            alert.informativeText += "\n\n지금은 앱 업데이트 후 Wine 환경을 새 버전에 맞추는 중입니다. 지금 종료하면 이 업데이트가 중단되며, 다음 실행 때 다시 시도하거나 업데이트 전 상태로 복원할 수 있습니다."
+        }
         alert.addButton(withTitle: "세션 종료"); alert.addButton(withTitle: "취소")
         if alert.runModal() == .alertFirstButtonReturn { session.stop(running) }
     }
@@ -183,8 +362,8 @@ final class LibraryModel: ObservableObject {
                 switch result {
                 case .success(let launcher):
                     self.registry.launchers.append(launcher); self.registry.selectedID = launcher.id; self.save()
-                    self.importMessage = "\(launcher.name)을(를) 등록했습니다. 원본 파일은 그대로 보존됩니다."
-                case .failure(let error): self.importMessage = "가져오지 못했습니다."; self.error(error)
+                    self.session.message = "\(launcher.name)을(를) 등록했습니다. 원본 파일은 그대로 보존됩니다."
+                case .failure(let error): self.session.message = "가져오지 못했습니다."; self.error(error)
                 }
             }
         }
@@ -282,7 +461,7 @@ final class LibraryModel: ObservableObject {
                     return
                 }
                 let alert = NSAlert(); alert.messageText = "설치된 프로그램을 등록할까요?"
-                alert.informativeText = "설치 파일이 공용 Wine 환경에 추가한 프로그램입니다. 등록할 항목을 선택해 주세요."
+                alert.informativeText = "설치 파일이 \(self.place(environment))에 추가한 프로그램입니다. 등록할 항목을 선택해 주세요."
                 let boxes = fresh.map { candidate -> NSButton in
                     let box = NSButton(checkboxWithTitle: candidate.title, target: nil, action: nil)
                     box.state = candidate.shortcut ? .on : .off
@@ -311,9 +490,11 @@ final class LibraryModel: ObservableObject {
     /// Deletes the selected program the way its kind allows; files go to the Trash.
     func deleteProgram() {
         guard let selected, !session.isRunning(selected.id) else { return }
-        if let prefix = try? store.prefix(selected), let running = session.session(in: prefix) {
+        let programPrefix = try? store.prefix(selected)
+        if let prefix = programPrefix, let running = session.session(in: prefix) {
             self.error(AlchemacError.message("같은 Wine 환경에서 ‘\(running.title)’이(가) 실행 중입니다. 세션을 먼저 종료해 주세요.")); return
         }
+        if let prefix = programPrefix, PrefixMigration.isEnvironmentBusy(prefix) { self.error(OrphanSession(prefix: prefix)); return }
         let sharing = registry.launchers.filter { $0.id != selected.id && !$0.privatePrefix && $0.environment == selected.environment }
         let ownEnvironment = !selected.privatePrefix && selected.environment != nil && sharing.isEmpty
         let entry = store.uninstallEntry(for: selected)
@@ -371,14 +552,16 @@ final class LibraryModel: ObservableObject {
                 let folders = try store.deletionFolders(for: selected, environmentToo: also)
                 importing = true; importMessage = "휴지통으로 옮기는 중입니다…"
                 DispatchQueue.global(qos: .userInitiated).async {
-                    let result = Result { try folders.forEach { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) } }
+                    // The program's folders may hold or sit beside its environment: move them only while no supervisor uses it.
+                    let move = { try folders.forEach { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) } }
+                    let result = Result { if let prefix = programPrefix { try PrefixMigration.withEnvironmentFree(prefix, move) } else { try move() } }
                     DispatchQueue.main.async {
                         self.importing = false
                         switch result {
                         case .success:
                             self.unregister(selected)
-                            self.importMessage = "\(selected.name)을(를) 휴지통으로 옮기고 목록에서 뺐습니다. 휴지통에서 되살릴 수 있습니다."
-                        case .failure(let error): self.importMessage = "삭제하지 못했습니다."; self.error(error)
+                            self.session.message = "\(selected.name)을(를) 휴지통으로 옮기고 목록에서 뺐습니다. 휴지통에서 되살릴 수 있습니다."
+                        case .failure(let error): self.session.message = "삭제하지 못했습니다."; self.error(error)
                         }
                     }
                 }
@@ -414,6 +597,11 @@ final class LibraryModel: ObservableObject {
     func revealGame() {
         if let selected, let game = try? store.game(selected) { NSWorkspace.shared.open(game) }
     }
+    /// Selects the last problem run's own log files in Finder.
+    func revealProblemLog() {
+        let logs = session.lastProblemLogs.filter { FileManager.default.fileExists(atPath: $0.path) }
+        if logs.isEmpty { revealLogs() } else { NSWorkspace.shared.activateFileViewerSelecting(logs) }
+    }
     func revealLogs() {
         let url = store.logs
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -448,8 +636,14 @@ struct LibraryView: View {
             List(selection: $model.registry.selectedID) {
                 ForEach(model.registry.launchers) { launcher in
                     HStack(spacing: 12) {
-                        Image(systemName: "gamecontroller.fill").font(.title2).foregroundStyle(.mint)
-                            .frame(width: 42, height: 42).background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+                        Group {
+                            if let icon = model.icons[launcher.id] {
+                                Image(nsImage: icon).resizable().interpolation(.high).scaledToFit().padding(5)
+                            } else {
+                                Image(systemName: "gamecontroller.fill").font(.title2).foregroundStyle(.mint)
+                            }
+                        }.frame(width: 42, height: 42).background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+                            .task(id: launcher.id + launcher.executable) { await model.loadIcon(launcher) }
                         VStack(alignment: .leading, spacing: 4) {
                             Text(launcher.name).font(.headline)
                             Text(launcher.detail + (model.retinaOn(launcher) ? " · 선명한 화면" : "") + (launcher.scaled ? " · 크기 보정" : ""))
@@ -489,6 +683,7 @@ struct LibraryView: View {
                         Button(selected.scaled ? "크기 보정 끄기" : "크기 보정 켜기 (작게 보일 때)", action: model.toggleScaled).disabled(locked)
                     }
                     Divider()
+                    Button("이 실행의 로그 열기", action: model.revealProblemLog).disabled(session.lastProblemLogs.isEmpty)
                     Button("진단 로그 열기", action: model.revealLogs)
                     Button("오픈소스 라이선스") { NSWorkspace.shared.open(AlchemacRuntime.licenses) }
                 }.fixedSize()
@@ -517,6 +712,9 @@ struct LibraryView: View {
                             }
                         }
                     }
+                    Divider()
+                    Button("남은 세션 확인…") { model.checkOrphans(startup: false) }.disabled(locked)
+                    Button("환경 백업 정리…", action: model.manageBackups).disabled(locked)
                 }.fixedSize()
                 Spacer()
                 if let running = model.selectedSession {
@@ -539,6 +737,9 @@ struct LibraryView: View {
                     }
                     Text(model.importing ? model.importMessage : session.message).font(.callout).foregroundStyle(.secondary)
                         .textSelection(.enabled)
+                    if !model.importing, !session.busy, !session.lastProblemLogs.isEmpty {
+                        Button("이 실행의 로그 열기", action: model.revealProblemLog).font(.caption)
+                    }
                 }.frame(maxWidth: .infinity, alignment: .leading)
             }.frame(minHeight: 32, alignment: .top)
             Text("Windows 프로그램 실행 플랫폼 · 프로그램마다 동작이 다를 수 있습니다.")
@@ -571,6 +772,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window.center(); window.makeKeyAndOrderFront(nil); self.window = window
             NSApp.activate(ignoringOtherApps: true)
             // Opening the app never starts Wine or a launcher.
+            model.showRecoveryNotice()
+            model.checkOrphans(startup: true)
+            model.startCleanup()
         } catch {
             let alert = NSAlert(); alert.messageText = "보관함을 열 수 없습니다"; alert.informativeText = error.localizedDescription
             alert.runModal(); NSApp.terminate(nil)
@@ -590,6 +794,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if model.session.allStopping { waitingToQuit = true; return .terminateLater }
         let alert = NSAlert(); alert.messageText = "실행 중인 세션을 종료하고 앱을 닫을까요?"
         alert.informativeText = "열려 있는 작업이나 게임을 먼저 저장해 주세요. 실행 중인 프로그램이 모두 종료된 뒤 앱을 닫습니다."
+        if model.session.sessions.values.contains(where: \.migrating) {
+            alert.informativeText += "\n\n지금은 앱 업데이트 후 Wine 환경을 새 버전에 맞추는 중입니다. 지금 종료하면 이 업데이트가 중단되며, 다음 실행 때 다시 시도하거나 업데이트 전 상태로 복원할 수 있습니다."
+        }
         alert.addButton(withTitle: "세션 종료 후 앱 닫기"); alert.addButton(withTitle: "취소")
         guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
         waitingToQuit = true; model.session.stopAll(); return .terminateLater

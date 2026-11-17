@@ -102,11 +102,8 @@ enum AlchemacRuntime {
         guard fm.fileExists(atPath: profile.path), fm.fileExists(atPath: font.path) else {
             throw AlchemacError.message("한글 글꼴 준비 파일이 누락됐습니다. 앱을 다시 설치해 주세요.")
         }
-        refreshD3D9(prefix: prefix, runtime: runtime)
-        // standalone-run creates an absent prefix next to itself, so its parent must exist.
-        try fm.createDirectory(at: prefix.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        // No filesystem change here: the caller may still refuse a busy environment. `beforeLaunch` does the rest.
         let logs = store.logs.appendingPathComponent(name, isDirectory: true)
-        try fm.createDirectory(at: logs, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         process.executableURL = script
         // Prepare this locked prefix, then start the program as a child.
         // standalone-run waits for the whole Wine session, not just this helper.
@@ -121,34 +118,21 @@ enum AlchemacRuntime {
             "WINEPREFIX": prefix.path, "HADRON_SUPPORT": store.support.path,
             "HADRON_LOGS": logs.path, "HADRON_WORKDIR": workdir.path, "HADRON_APP_NAME": "Alchemac Runtime"
         ]
-        // Add-on settings are limited to Addon.allowedEnvironment and never replace Alchemac's own keys.
-        for (key, value) in settings where Addon.allowedEnvironment.contains(key) && environment[key] == nil { environment[key] = value }
+        // Add-on settings are limited to Addon.allowedEnvironment, shaped by Addon.allowedValue (also for add-ons installed by older versions) and never replace Alchemac's own keys.
+        for (key, value) in settings where Addon.allowedEnvironment.contains(key) && Addon.allowedValue(key, value) && environment[key] == nil { environment[key] = value }
         process.environment = environment
     }
 
-    /// A prefix receives mtld3d's native d3d9.dll only when it is created. For an existing, complete prefix this
-    /// replaces that file with the runtime's when they differ. A file without the "mtld3d" marker (Wine's builtin
-    /// or one a user put there) and an absent file are left alone. Failures are logged and never stop the launch.
-    static func refreshD3D9(prefix: URL, runtime: URL) {
+    /// Filesystem work a configured process needs, run by the session controller only after it has accepted
+    /// the launch (the Wine environment is not busy). mtld3d's d3d9.dll in the prefix is refreshed by
+    /// prefix-profile.exe in the same run, after the runtime's own migration.
+    static func beforeLaunch(_ process: Process) throws {
+        guard let prefixPath = process.environment?["WINEPREFIX"], let logsPath = process.environment?["HADRON_LOGS"] else { return }
         let fm = FileManager.default
-        guard fm.fileExists(atPath: prefix.appendingPathComponent(".hadron-prefix-ready").path),
-              !fm.fileExists(atPath: prefix.appendingPathComponent(".hadron-migration-incomplete").path) else { return }
-        let source = runtime.appendingPathComponent("dist/lib/hadron/d3d9", isDirectory: true)
-        for (arch, folder) in [("aarch64", "system32"), ("i386", "syswow64")] {
-            let new = source.appendingPathComponent(arch + "/d3d9.dll")
-            let old = prefix.appendingPathComponent("drive_c/windows/" + folder + "/d3d9.dll")
-            guard let current = try? Data(contentsOf: old), current.range(of: Data("mtld3d".utf8)) != nil,
-                  let latest = try? Data(contentsOf: new), latest != current else { continue }
-            let temp = old.deletingLastPathComponent().appendingPathComponent(".d3d9.dll.alchemac-\(UUID().uuidString)")
-            do {
-                try latest.write(to: temp)
-                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: temp.path)
-                guard rename(temp.path, old.path) == 0 else { throw AlchemacError.message(String(cString: strerror(errno))) }
-            } catch {
-                try? fm.removeItem(at: temp)
-                fputs("Alchemac: d3d9.dll refresh failed (\(folder)): \(error)\n", stderr)
-            }
-        }
+        let prefix = URL(fileURLWithPath: prefixPath)
+        // standalone-run creates an absent prefix next to itself, so its parent must exist.
+        try fm.createDirectory(at: prefix.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try fm.createDirectory(at: URL(fileURLWithPath: logsPath, isDirectory: true), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     }
 
     static func windows(_ path: URL) -> String { "Z:" + path.path.replacingOccurrences(of: "/", with: "\\") }

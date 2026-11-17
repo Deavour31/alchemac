@@ -63,7 +63,9 @@ optional `README.md` and `LICENSE`. Nothing else in the folder is installed.
   `shared` uses the default one.
 - `launch.env`: only `WINEDLLOVERRIDES`, `DOTNET_BUNDLE_EXTRACT_BASE_DIR`,
   `DXMT_CONFIG`, `MTLD3D_CONFIG`, `MTL_HUD_ENABLED` and the `HADRON_*` options
-  listed in `Addon.swift` are accepted.
+  listed in `Addon.swift` are accepted, and each value must have the shape
+  `Addon.allowedValue` expects for its key (for example `HADRON_MEM_LIMIT_GB`
+  is a plain number, `*_CONFIG` has no `log.`/`debug.` keys or paths).
 - `launch.englishInput`: select an English keyboard layout before starting.
 
 ## Storage
@@ -72,6 +74,9 @@ optional `README.md` and `LICENSE`. Nothing else in the folder is installed.
 - Logs: `~/Library/Logs/Alchemac/`. Logs can contain personal data; redact them
   before sharing.
 - Deleting moves files to the Trash.
+- Each Wine environment runs from a private copy of the bundled runtime. Before a
+  new session starts, the copy is checked against the signed app (entry list, sizes,
+  change times, host scripts byte for byte); a changed copy is deleted and recreated.
 
 ## Building from source
 
@@ -83,7 +88,9 @@ small Windows helper, and a Hadron runtime built from Hadron 0.3.0
 (Korean calendar era name in Wine's locale data). mtld3d's native `d3d9.dll` files (ARM64X and 32-bit) are rebuilt with the
 patches `hadron/patches/mtld3d/0004-…`–`0006-…` (fixes needed by WPF hardware rendering) and `0007-…` (links the 32-bit one against llvm-mingw's CRT instead of the MSVC CRT) using
 `tools/runtime/build-mtld3d-d3d9.sh` (no Wine tree needed) and installed with
-`tools/runtime/patch-mtld3d-d3d9.py [--i386 <i386-d3d9.dll>] <runtime> <new-runtime> d3d9.dll <patch>...`. See `hadron/README.md`. Place `wine-mono-11.3.0-x86.msi` (from
+`tools/runtime/patch-mtld3d-d3d9.py [--i386 <i386-d3d9.dll>] <runtime> <new-runtime> d3d9.dll <patch>...`. Wine's `win32u.so`
+is rebuilt with `hadron/patches/wine/0030-…` (a window that a `WH_CBT` hook turns into a child is reparented
+like on Windows) and installed with `tools/runtime/patch-wine-unix-lib.py <runtime> <new-runtime> win32u.so <patch>...`. See `hadron/README.md`. Place `wine-mono-11.3.0-x86.msi` (from
 https://dl.winehq.org/wine/wine-mono/11.3.0/) and its `COPYING` in `work/wine-mono/`.
 
 Before every launch the Windows helper (`prefix-profile.c`) prepares the environment's prefix:
@@ -94,10 +101,19 @@ the font is absent and no entry exists). WPF hardware rendering is on by default
 
 If the environment has no `Internet Settings\Connections\DefaultConnectionSettings` value, the helper writes a direct-connection one (proxy auto-detect off). Wine derives the WPAD host from the Mac's `<name>.local` host name, and on some networks `wpad.local` accepts the connection but never answers, which stalls the first .NET/WinHTTP request for 60 s; Windows does not search WPAD under `.local`. An existing value, such as a proxy the user configured, is left alone.
 
-A Wine environment receives mtld3d's `d3d9.dll` only when it is created. Before a launch the app
-(`refreshD3D9` in `Runtime.swift`) replaces that file in an existing, complete environment with the
-runtime's when it differs. Only a file that is already mtld3d's is replaced; Wine's builtin, a file a
-user put there, or an absent file is never touched. Failures are logged and do not stop the launch.
+A Wine environment receives mtld3d's `d3d9.dll` only when it is created. On every run except `--check` the
+helper (`refresh_d3d9` in `prefix-profile.c`, after the runtime's own migration and before the target starts)
+replaces that file in `C:\windows\system32` (aarch64) and `C:\windows\syswow64` (i386) with the one in
+`..\SharedSupport\runtime\dist\lib\hadron\d3d9` of the app, when it differs. Only a file that already contains
+the "mtld3d" marker is replaced (copy to a temporary file, then `MoveFileEx`); Wine's builtin, a file a user put
+there, or an absent file is never touched. Failures print `prefix-profile: d3d9 refresh failed (...)` and do not
+stop the launch. The helper is an x86_64 PE, but x64 code on ARM64 Wine is not a WOW64 process, so
+`system32` is not redirected for it.
+
+The app also looks after leftovers: at launch it offers to stop Wine sessions an earlier run left behind (the
+supervisor holds the environment's session lock; see `OrphanSessions` in `Maintenance.swift`), cleans stale
+staging folders and old private runtime copies in the background (`StartupCleanup`), and "Wine 환경 > 환경 백업 정리…"
+keeps only the newest migration snapshot of each environment (`Backups`).
 
 ## License
 

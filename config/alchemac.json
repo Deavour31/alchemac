@@ -1,5 +1,5 @@
 {
   "schema_version": 1,
-  "runtime_build_id": "0.3.0-t4-fex-suspend-8e79617d0edc1ec8-8ec1efbd-nls1-d3d9b",
+  "runtime_build_id": "0.3.0-ac5",
   "notes": "Alchemac app configuration. The runtime is Hadron 0.3.0 with downstream FEX patch 0006 (built with install prefix /opt/alchemac) and the FEX cache-clearing adapter."
 }

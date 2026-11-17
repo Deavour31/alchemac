@@ -8,6 +8,7 @@ array and crash indexing it at startup under a Korean locale.
 Run with `python3 -I`.
 
 Usage: patch-locale-nls.py <base-runtime> [<new-runtime>]
+Keep <new-runtime> SHORT (e.g. 0.3.0-ac6, never base-id plus suffix): the runtime root is limited to 180 characters.
 
 With two arguments the base runtime folder is cloned (APFS clone, `cp -c -R`) to the new
 folder, its BUILD-ID is set to the new folder's name and NLS-PATCH.json is written.
@@ -29,6 +30,12 @@ ERA = '단기'
 CAL_KOREA = 5
 INSERT = 16
 
+
+def check_id_length(name):
+    # standalone-run refuses a runtime root over 180 chars; allow a 32-char user name.
+    n = len('/Users/' + 'x' * 32 + '/Library/Application Support/Alchemac/runtime.noindex/prefix-sessions/' + '0' * 32 + '/runtimes/' + name)
+    if n > 180:
+        raise SystemExit('new runtime name %r is too long (runtime root would be %d chars, limit 180); use a short name such as 0.3.0-ac6' % (name, n))
 
 def sha(b): return hashlib.sha256(b).hexdigest()
 
@@ -103,6 +110,7 @@ def main():
         raise SystemExit(__doc__)
     base = Path(args[0]).resolve()
     new = Path(args[1]).resolve() if len(args) == 2 else base
+    if new is not base: check_id_length(new.name)
     src = base / REL
     data = src.read_bytes()
     got = sha(data)

@@ -8,6 +8,7 @@ tools/runtime/build-mtld3d-d3d9.sh. mtld3d.dll and mtld3d.so stay as in the base
 Run with `python3 -I`.
 
 Usage: patch-mtld3d-d3d9.py [--i386 <i386-d3d9.dll>] <base-runtime> <new-runtime> <d3d9.dll> <patch>...
+Keep <new-runtime> SHORT (e.g. 0.3.0-ac6, never base-id plus suffix): the runtime root is limited to 180 characters.
 
 The base runtime folder is cloned (APFS clone, `cp -c -R`) to the new folder (which must
 not exist), its BUILD-ID is set to the new folder's name, the DLL is replaced, one line
@@ -29,6 +30,12 @@ MTLD3D_BASE = '20707710a67c60c16ef78c5425acd87e9b3d3bc5'
 MACHINE_ARM64 = 0xAA64
 MACHINE_I386 = 0x014C
 
+
+def check_id_length(name):
+    # standalone-run refuses a runtime root over 180 chars; allow a 32-char user name.
+    n = len('/Users/' + 'x' * 32 + '/Library/Application Support/Alchemac/runtime.noindex/prefix-sessions/' + '0' * 32 + '/runtimes/' + name)
+    if n > 180:
+        raise SystemExit('new runtime name %r is too long (runtime root would be %d chars, limit 180); use a short name such as 0.3.0-ac6' % (name, n))
 
 def sha(b): return hashlib.sha256(b).hexdigest()
 
@@ -53,6 +60,7 @@ def main():
     if len(args) < 4:
         raise SystemExit(__doc__)
     base, new = Path(args[0]).resolve(), Path(args[1]).resolve()
+    check_id_length(new.name)
     dll = Path(args[2]).resolve()
     patches = [Path(p).resolve() for p in args[3:]]
     if new.exists():

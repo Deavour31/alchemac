@@ -224,10 +224,79 @@ final class LauncherStore: @unchecked Sendable {
         launcher.kind == .installed ? launcher.executable : AlchemacRuntime.windows(try executable(launcher))
     }
 
+    var backupURL: URL { root.appendingPathComponent("launchers.json.bak") }
+    /// What `read()` did to keep the app usable (a backup used, a broken file set aside), for the user to be told once.
+    private(set) var recoveryNotice: String?
+
+    /// A launchers.json entry that may not decode or validate; one bad entry must not hide the others.
+    private struct Lossy: Decodable {
+        let launcher: Launcher?
+        init(from decoder: Decoder) throws { launcher = try? Launcher(from: decoder) }
+    }
+    private struct RawRegistry: Decodable {
+        let schemaVersion: Int
+        let selectedID: String?
+        let launchers: [Lossy]
+    }
+
+    /// A registry file that decodes and fully validates, else nil. Never throws.
+    private func validRegistry(at url: URL) -> (Registry, Data)? {
+        guard (try? requireLocal(url)) != nil, let data = try? Data(contentsOf: url),
+              let registry = try? JSONDecoder().decode(Registry.self, from: data), (try? registry.validate()) != nil else { return nil }
+        return (registry, data)
+    }
+
+    /// A new name beside launchers.json for a file that is set aside, never an existing one.
+    private func preservedURL(_ kind: String) -> URL {
+        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let stamp = formatter.string(from: Date())
+        var url = root.appendingPathComponent("launchers.\(kind)-\(stamp).json"), number = 2
+        while fm.fileExists(atPath: url.path) { url = root.appendingPathComponent("launchers.\(kind)-\(stamp)-\(number).json"); number += 1 }
+        return url
+    }
+
+    /// Reads the registry. A damaged file is set aside rather than overwritten and the last good backup is used;
+    /// launchers that no longer validate are left out of the list and the original file is kept. A file from a
+    /// newer Alchemac is the one case that throws, so that nothing is changed.
     func read() throws -> Registry {
-        guard fm.fileExists(atPath: registryURL.path) else { return Registry() }
+        recoveryNotice = nil
+        guard fm.fileExists(atPath: registryURL.path) else {
+            if let (backup, _) = validRegistry(at: backupURL) {
+                recoveryNotice = "프로그램 목록 파일(launchers.json)이 없어 마지막 백업(launchers.json.bak)으로 복구했습니다."
+                return backup
+            }
+            return Registry()
+        }
         try requireLocal(registryURL)
-        let value = try JSONDecoder().decode(Registry.self, from: Data(contentsOf: registryURL))
+        let data = try Data(contentsOf: registryURL)
+        guard let raw = try? JSONDecoder().decode(RawRegistry.self, from: data), raw.schemaVersion >= 1 else {
+            let kept = preservedURL("corrupt")
+            try fm.moveItem(at: registryURL, to: kept)
+            let note = "프로그램 목록 파일을 읽을 수 없어 ‘\(kept.lastPathComponent)’으로 따로 보관했습니다."
+            if let (backup, _) = validRegistry(at: backupURL) {
+                recoveryNotice = note + " 마지막 백업(launchers.json.bak)으로 목록을 복구했습니다."
+                return backup
+            }
+            recoveryNotice = note + " 백업이 없어 빈 목록으로 시작합니다."
+            return Registry()
+        }
+        guard raw.schemaVersion == 1 else {
+            throw AlchemacError.message("프로그램 목록이 더 새로운 버전의 Alchemac에서 만들어졌습니다. 최신 Alchemac을 설치해 주세요. 기존 데이터는 그대로 보존됩니다.")
+        }
+        var launchers: [Launcher] = [], seen = Set<String>(), dropped = 0
+        for entry in raw.launchers {
+            guard let launcher = entry.launcher, (try? launcher.validate()) != nil, seen.insert(launcher.id).inserted else { dropped += 1; continue }
+            launchers.append(launcher)
+        }
+        var value = Registry(schemaVersion: 1, selectedID: raw.selectedID, launchers: launchers)
+        if let selected = value.selectedID, !seen.contains(selected) { value.selectedID = launchers.first?.id }
+        if dropped > 0 {
+            // The file is only rewritten by a later save, but keep the original before anything can replace it.
+            let kept = preservedURL("invalid")
+            try data.write(to: kept, options: .atomic)
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: kept.path)
+            recoveryNotice = "읽을 수 없는 프로그램 \(dropped)개를 목록에서 뺐습니다. 원래 파일은 ‘\(kept.lastPathComponent)’에 보관했습니다."
+        }
         try value.validate()
         return value
     }
@@ -235,6 +304,11 @@ final class LauncherStore: @unchecked Sendable {
     func write(_ registry: Registry) throws {
         try registry.validate()
         try requireLocal(registryURL)
+        // Keep the last file that was fully valid; a file that does not validate never replaces the backup.
+        if let (_, current) = validRegistry(at: registryURL), (try? Data(contentsOf: backupURL)) != current, (try? requireLocal(backupURL)) != nil {
+            try? current.write(to: backupURL, options: .atomic)
+            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backupURL.path)
+        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(registry).write(to: registryURL, options: .atomic)

@@ -14,9 +14,18 @@ PROFILE = json.loads((ROOT / 'config/alchemac.json').read_text())
 RUNTIME = next((d for d in (ROOT / 'work/hadron-prototype' / b / PROFILE['runtime_build_id'] for b in ('t4-builds', 't2-builds'))
                 if (d / 'BUILD-ID').exists()), None)
 if RUNTIME is None: raise SystemExit('Runtime build not found: ' + PROFILE['runtime_build_id'])
+# standalone-run refuses a runtime root longer than 180 characters (the Wine bootstrap path limit).
+# The root is $HOME/Library/Application Support/Alchemac/runtime.noindex/prefix-sessions/<32 hex>/runtimes/<id>,
+# so a long build id silently breaks every user whose home folder name is longer than a few characters.
+# Allow a 32-character user name.
+_longest_root = len('/Users/' + 'x' * 32 + '/Library/Application Support/Alchemac/runtime.noindex/prefix-sessions/'
+                    + '0' * 32 + '/runtimes/' + PROFILE['runtime_build_id'])
+if _longest_root > 180:
+    raise SystemExit('runtime_build_id %r is too long: runtime root would be %d chars for a 32-char user name (limit 180); use a short id'
+                     % (PROFILE['runtime_build_id'], _longest_root))
 RELEASE = '--release' in sys.argv[1:]
 BUNDLE_ID = 'io.github.deavour31.alchemac'
-VERSION, BUILD = '0.5.8', '29'
+VERSION, BUILD = '0.5.12', '35'
 # https://dl.winehq.org/wine/wine-mono/11.3.0/wine-mono-11.3.0-x86.msi, the version this Wine asks for.
 WINE_MONO_SHA256 = 'df2dfc1665c2511882e7cabd56eafd0c0a3d94e5a7e86f969277f6c189d418d3'
 PARENT = ROOT / ('outputs/alchemac-release.noindex' if RELEASE else 'outputs/alchemac-app-build.noindex')
@@ -53,7 +62,7 @@ def main():
     shutil.rmtree(contents / 'SharedSupport/runtime/steam')
     for script in (contents / 'SharedSupport/runtime/scripts').glob('steam-*'):
         script.unlink()
-    sources = [ROOT / 'app/alchemac' / n for n in ('main.swift', 'App.swift', 'Runtime.swift', 'SessionController.swift', 'Profile.swift', 'InputSource.swift', 'Addon.swift')]
+    sources = [ROOT / 'app/alchemac' / n for n in ('main.swift', 'App.swift', 'Runtime.swift', 'SessionController.swift', 'Profile.swift', 'InputSource.swift', 'Addon.swift', 'ExeIcon.swift', 'Maintenance.swift')]
     run(['/usr/bin/xcrun', 'swiftc', '-O', '-swift-version', '5', '-target', 'arm64-apple-macos27.0', '-module-cache-path', CACHE,
          '-o', contents / 'MacOS/Alchemac', *sources])
     fonts = resources / 'Fonts'

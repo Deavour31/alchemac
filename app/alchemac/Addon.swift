@@ -52,6 +52,36 @@ struct Addon: Codable, Hashable, Identifiable {
             && !name.contains(where: { "/\\\"".contains($0) }) && !name.unicodeScalars.contains(where: { $0.properties.generalCategory == .control })
     }
 
+    private static func matches(_ value: String, _ pattern: String) -> Bool {
+        value.range(of: pattern, options: .regularExpression)?.lowerBound == value.startIndex
+            && value.range(of: pattern, options: .regularExpression)?.upperBound == value.endIndex
+    }
+
+    /// Whether a setting value is safe to hand to the runtime. Some values reach shell arithmetic (`$(( ... ))`
+    /// in the watchdog, where bash evaluates `a[$(cmd)]`) or config parsers, so each key has a strict shape.
+    static func allowedValue(_ key: String, _ value: String) -> Bool {
+        switch key {
+        case "HADRON_MEM_LIMIT_GB": return matches(value, "[1-9][0-9]{0,2}")
+        case "HADRON_VSYNC": return ["game", "on", "off"].contains(value)
+        case "HADRON_D3D9": return ["mtld3d", "wined3d"].contains(value)
+        case "HADRON_D3D12": return ["auto", "vkd3d", "wine"].contains(value)
+        case "HADRON_HARDWARE_TSO", "HADRON_LARGE_ADDRESS_AWARE", "HADRON_PRECISE_SCROLLING", "MTL_HUD_ENABLED": return value == "0" || value == "1"
+        case "WINEDLLOVERRIDES": return matches(value, "[A-Za-z0-9_.,;=*+-]{1,512}")
+        case "DXMT_CONFIG", "MTLD3D_CONFIG":
+            // key=value pairs; logging and debug dump options would write to paths the add-on chooses.
+            return value.split(separator: ";", omittingEmptySubsequences: true).allSatisfy { entry in
+                let parts = entry.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+                guard parts.count == 2, matches(parts[0], "[A-Za-z0-9_.]+"), matches(parts[1], "[A-Za-z0-9_.,:+-]*") else { return false }
+                let lower = parts[0].lowercased()
+                return !lower.hasPrefix("debug.") && !lower.hasPrefix("log.")
+            }
+        case "DOTNET_BUNDLE_EXTRACT_BASE_DIR":
+            guard value.count <= 200, value.lowercased().hasPrefix("c:\\"), matches(String(value.dropFirst(3)), "[A-Za-z0-9_ .\\\\-]*") else { return false }
+            return !value.dropFirst(3).split(separator: "\\", omittingEmptySubsequences: false).contains("..")
+        default: return false
+        }
+    }
+
     func validate() throws {
         func fail(_ reason: String) -> AlchemacError { .message("애드온 ‘\(name)’을(를) 사용할 수 없습니다: \(reason)") }
         guard schema == 1 else { throw fail("지원하지 않는 형식(schema \(schema))입니다.") }
@@ -63,7 +93,7 @@ struct Addon: Codable, Hashable, Identifiable {
         guard exclusions.count <= 64, exclusions.allSatisfy({ $0 == ".*" || Self.plainName($0) }) else { throw fail("제외 목록이 올바르지 않습니다.") }
         for (key, value) in launchEnvironment {
             guard Self.allowedEnvironment.contains(key) else { throw fail("허용되지 않는 환경 변수 \(key)입니다.") }
-            guard value.count <= 512, !value.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) else { throw fail("\(key) 값이 올바르지 않습니다.") }
+            guard Self.allowedValue(key, value), value.count <= 512, !value.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) else { throw fail("\(key) 값이 올바르지 않습니다.") }
         }
     }
 

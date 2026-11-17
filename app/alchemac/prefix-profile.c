@@ -277,6 +277,104 @@ static void set_folder_dpi_override(const wchar_t *exe, BOOL scaled) {
     FindClose(search);
 }
 
+/* Wine patch 0009 redirects steamclient(64).dll to a bridge into the host's Steam unless
+ * HADRON_DISABLE_LSTEAMCLIENT is set to something other than "0", and the standalone path cannot pass
+ * that variable. Wine loads HKCU\Environment into every process's environment, so the value is created
+ * there (an existing value, such as a user's "0", is left alone). A process started by this helper in
+ * its first run inherits this process's environment, which predates the new value, so it is set here too. */
+static void disable_steam_redirect(void) {
+    static const wchar_t name[] = L"HADRON_DISABLE_LSTEAMCLIENT";
+    wchar_t value[16] = L"1";
+    HKEY key;
+    DWORD size = sizeof(value) - sizeof(wchar_t), type = 0;
+    LONG result = RegCreateKeyExW(HKEY_CURRENT_USER, L"Environment", 0, NULL, 0,
+        KEY_QUERY_VALUE | KEY_SET_VALUE, NULL, &key, NULL);
+    if (result != ERROR_SUCCESS) {
+        fprintf(stderr, "prefix-profile: Steam redirect registry key failed (Win32 %ld)\n", (long)result);
+    } else {
+        wchar_t existing[16] = {0};
+        result = RegQueryValueExW(key, name, NULL, &type, (BYTE *)existing, &size);
+        if (result == ERROR_SUCCESS && type == REG_SZ && existing[0]) {
+            wcscpy(value, existing);
+        } else if (result == ERROR_FILE_NOT_FOUND) {
+            result = RegSetValueExW(key, name, 0, REG_SZ, (const BYTE *)L"1", 2 * sizeof(wchar_t));
+            if (result != ERROR_SUCCESS)
+                fprintf(stderr, "prefix-profile: Steam redirect registry value failed (Win32 %ld)\n", (long)result);
+        }
+        RegCloseKey(key);
+    }
+    if (!GetEnvironmentVariableW(name, NULL, 0) && GetLastError() == ERROR_ENVVAR_NOT_FOUND
+            && !SetEnvironmentVariableW(name, value))
+        fprintf(stderr, "prefix-profile: Steam redirect environment failed (Win32 %lu)\n", GetLastError());
+}
+
+/* Reads a whole file, at most 64 MB; NULL when it cannot be read. Shared read/write/delete so a DLL that
+ * running processes have mapped can still be read. */
+static BYTE *read_whole(const wchar_t *path, DWORD *size) {
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE) return NULL;
+    LARGE_INTEGER length; BYTE *data = NULL; DWORD got = 0;
+    if (GetFileSizeEx(file, &length) && length.QuadPart > 0 && length.QuadPart <= (64 << 20)
+            && (data = HeapAlloc(GetProcessHeap(), 0, (SIZE_T)length.QuadPart))) {
+        if (!ReadFile(file, data, (DWORD)length.QuadPart, &got, NULL) || got != length.QuadPart) { HeapFree(GetProcessHeap(), 0, data); data = NULL; }
+        else *size = got;
+    }
+    CloseHandle(file);
+    return data;
+}
+
+/* mtld3d's native d3d9.dll is copied into a prefix only when the prefix is created. After the runtime
+ * migrated an environment (or for one that is up to date) the copy in the prefix may be older than the
+ * mtld3d.dll/.so of the runtime that runs it, so it is replaced here, in the same run and after
+ * prefix-init's migration. The app's bundled runtime sits at ..\SharedSupport\runtime of this helper
+ * (Contents\Resources\prefix-profile.exe); where it does not (tests), nothing happens.
+ * Only a file that is already mtld3d's (contains "mtld3d") and differs is replaced: Wine's builtin, a
+ * user's own file and an absent file are left alone. The copy goes to a temporary file in the same
+ * directory and replaces the target with MoveFileEx, so a failure never leaves a half-written DLL.
+ * This helper is an x86_64 PE, but on ARM64 Wine x64 code runs as ARM64EC inside an ARM64 process and
+ * is not a WOW64 process (only i386 and ARM32 are): there is no file system redirection for it
+ * (dlls/wow64/file.c get_file_redirect belongs to the 32-bit thunk layer, and kernelbase's
+ * get_machine_wow64_dir has no AMD64 case), so C:\windows\system32 is the real ARM64X folder that
+ * holds the aarch64 d3d9.dll and C:\windows\syswow64 is reached by its own name. */
+static void refresh_d3d9(void) {
+    static const struct { const wchar_t *arch, *folder; } files[] = {{L"aarch64", L"system32"}, {L"i386", L"syswow64"}};
+    wchar_t module[MAX_PATH], source_dir[MAX_PATH];
+    DWORD size = GetModuleFileNameW(NULL, module, MAX_PATH);
+    if (!size || size >= MAX_PATH) return;
+    wchar_t *slash = wcsrchr(module, L'\\');
+    if (!slash) return;
+    *slash = 0;
+    if (swprintf(source_dir, MAX_PATH, L"%ls\\..\\SharedSupport\\runtime\\dist\\lib\\hadron\\d3d9", module) < 0) return;
+    DWORD attributes = GetFileAttributesW(source_dir);
+    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY)) return;
+    for (size_t i = 0; i < ARRAYSIZE(files); i++) {
+        wchar_t source[MAX_PATH], target[MAX_PATH], temp[MAX_PATH];
+        if (swprintf(source, MAX_PATH, L"%ls\\%ls\\d3d9.dll", source_dir, files[i].arch) < 0
+                || swprintf(target, MAX_PATH, L"C:\\windows\\%ls\\d3d9.dll", files[i].folder) < 0
+                || swprintf(temp, MAX_PATH, L"C:\\windows\\%ls\\d3d9.dll.alchemac-%lu.tmp", files[i].folder, GetCurrentProcessId()) < 0) continue;
+        DWORD old_size = 0, new_size = 0;
+        BYTE *old_data = read_whole(target, &old_size);
+        if (!old_data) continue;                               /* absent: not ours to create */
+        BYTE *new_data = NULL;
+        BOOL marked = FALSE;
+        for (DWORD at = 0; !marked && old_size >= 6 && at <= old_size - 6; at++) marked = !memcmp(old_data + at, "mtld3d", 6);
+        if (marked && (new_data = read_whole(source, &new_size)) && (new_size != old_size || memcmp(old_data, new_data, old_size))) {
+            HANDLE out = CreateFileW(temp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            DWORD wrote = 0;
+            BOOL ok = out != INVALID_HANDLE_VALUE && WriteFile(out, new_data, new_size, &wrote, NULL) && wrote == new_size && FlushFileBuffers(out);
+            if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
+            if (ok && MoveFileExW(temp, target, MOVEFILE_REPLACE_EXISTING)) {
+                printf("prefix-profile: d3d9.dll refreshed (%ls)\n", files[i].folder);
+            } else {
+                fprintf(stderr, "prefix-profile: d3d9 refresh failed (%ls, Win32 %lu)\n", files[i].folder, GetLastError());
+                DeleteFileW(temp);
+            }
+        }
+        HeapFree(GetProcessHeap(), 0, old_data);
+        if (new_data) HeapFree(GetProcessHeap(), 0, new_data);
+    }
+}
+
 int wmain(int argc, wchar_t **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     /* --launch keeps the program's own DPI awareness, --launch-scaled has Wine scale it,
@@ -290,7 +388,9 @@ int wmain(int argc, wchar_t **argv) {
     link_korean_ui();
     restore_wpf_hardware();
     default_direct_connection();
+    disable_steam_redirect();
     if (!wcscmp(argv[1], L"--check")) return 0;
+    refresh_d3d9();
     if (!wcscmp(argv[1], L"--command")) {
         /* A registered Windows command line, such as an UninstallString, parsed by
          * CreateProcess the way Windows parses it. No shell is involved. */
@@ -326,7 +426,16 @@ int wmain(int argc, wchar_t **argv) {
     HeapFree(GetProcessHeap(), 0, command);
     if (!launched) return fail("original launcher CreateProcess");
     printf("prefix-profile: original launcher started, child=%lu\n", child.dwProcessId);
-    CloseHandle(child.hThread); CloseHandle(child.hProcess);
+    CloseHandle(child.hThread);
+    /* A program that ends right away is recorded for the app, which tells the user only when the whole
+     * session also ends at once (an updater that starts another program and leaves is not an error).
+     * Installers and tools (--setup) are expected to finish quickly and are not watched. The wait stops
+     * at 5 seconds, so a normal program is never held back longer than that. */
+    if (wcscmp(argv[1], L"--setup") && WaitForSingleObject(child.hProcess, 5000) == WAIT_OBJECT_0) {
+        DWORD code = 0;
+        if (GetExitCodeProcess(child.hProcess, &code)) printf("prefix-profile: target exited early, code=0x%08lx\n", (unsigned long)code);
+    }
+    CloseHandle(child.hProcess);
     /* The standalone supervisor waits for wineserver, including update/game children. */
     return 0;
 }
