@@ -71,7 +71,7 @@ enum AlchemacRuntime {
         let assets = resources ?? runtime.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Resources")
         let script = assets.appendingPathComponent("session-attach")
         guard FileManager.default.isExecutableFile(atPath: script.path) else {
-            throw AlchemacError.message("앱의 실행 환경이 누락됐습니다. 앱을 다시 설치해 주세요.")
+            throw AlchemacError.message("앱의 런타임이 누락됐습니다. 앱을 다시 설치해 주세요.")
         }
         process.executableURL = script
     }
@@ -97,7 +97,7 @@ enum AlchemacRuntime {
         try store.requireLocal(store.support)
         try store.requireLocal(prefix)
         guard fm.isExecutableFile(atPath: script.path), fm.fileExists(atPath: runtime.appendingPathComponent("BUILD-ID").path) else {
-            throw AlchemacError.message("앱의 실행 환경이 누락됐습니다. 앱을 다시 설치해 주세요.")
+            throw AlchemacError.message("앱의 런타임이 누락됐습니다. 앱을 다시 설치해 주세요.")
         }
         guard fm.fileExists(atPath: profile.path), fm.fileExists(atPath: font.path) else {
             throw AlchemacError.message("한글 글꼴 준비 파일이 누락됐습니다. 앱을 다시 설치해 주세요.")

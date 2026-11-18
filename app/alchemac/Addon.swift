@@ -83,8 +83,8 @@ struct Addon: Codable, Hashable, Identifiable {
     }
 
     func validate() throws {
-        func fail(_ reason: String) -> AlchemacError { .message("애드온 ‘\(name)’을(를) 사용할 수 없습니다: \(reason)") }
-        guard schema == 1 else { throw fail("지원하지 않는 형식(schema \(schema))입니다.") }
+        func fail(_ reason: String) -> AlchemacError { .message("사용할 수 없는 애드온입니다(‘\(name)’): \(reason)") }
+        guard schema == 1 else { throw AlchemacError.message("이 애드온 형식을 지원하지 않습니다. 최신 Alchemac에서 다시 시도해 주세요.") }
         guard id.range(of: "^[a-z0-9][a-z0-9-]{0,31}$", options: .regularExpression) != nil else { throw fail("ID가 올바르지 않습니다.") }
         guard !name.trimmingCharacters(in: .whitespaces).isEmpty, name.count <= 80, (summary?.count ?? 0) <= 400 else { throw fail("이름이나 설명이 올바르지 않습니다.") }
         guard version.range(of: #"^[0-9]+(\.[0-9]+){0,3}$"#, options: .regularExpression) != nil else { throw fail("버전이 올바르지 않습니다.") }
@@ -133,10 +133,8 @@ extension LauncherStore {
     func addon(_ id: String) -> Addon? { installedAddons().first { $0.id == id } }
     func matchingAddon(_ exe: URL) -> Addon? { installedAddons().first { $0.matches(exe) } }
 
-    /// Installs or replaces an add-on from a `.alchemacaddon` folder or its `addon.json`.
-    /// Only the manifest and a README or LICENSE are kept; nothing else in the bundle is copied.
-    @discardableResult
-    func installAddon(from source: URL) throws -> Addon {
+    /// Reads and validates an add-on from a `.alchemacaddon` folder or its `addon.json`, without installing it.
+    func readAddon(from source: URL) throws -> (addon: Addon, bundle: URL) {
         let bundle = source.lastPathComponent.lowercased() == "addon.json" ? source.deletingLastPathComponent() : source
         let manifest = bundle.appendingPathComponent("addon.json")
         guard let values = try? manifest.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey]),
@@ -145,8 +143,19 @@ extension LauncherStore {
         }
         let addon: Addon
         do { addon = try JSONDecoder().decode(Addon.self, from: Data(contentsOf: manifest)) }
-        catch { throw AlchemacError.message("addon.json을 읽을 수 없습니다: \(error.localizedDescription)") }
+        catch { throw AlchemacError.message("애드온 설정 파일을 읽지 못했습니다. 애드온을 다시 받아 설치해 주세요.") }
         try addon.validate()
+        return (addon, bundle)
+    }
+
+    /// Whether an add-on with this id is already installed (valid or not).
+    func addonExists(_ id: String) -> Bool { fm.fileExists(atPath: addonsFolder.appendingPathComponent(id).path) }
+
+    /// Installs or replaces an add-on from a `.alchemacaddon` folder or its `addon.json`.
+    /// Only the manifest and a README or LICENSE are kept; nothing else in the bundle is copied.
+    @discardableResult
+    func installAddon(from source: URL) throws -> Addon {
+        let (addon, bundle) = try readAddon(from: source)
         try fm.createDirectory(at: addonsFolder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try requireLocal(addonsFolder)
         let stage = addonsFolder.appendingPathComponent(".install-" + UUID().uuidString, isDirectory: true)

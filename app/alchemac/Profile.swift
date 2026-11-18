@@ -344,6 +344,54 @@ final class LauncherStore: @unchecked Sendable {
         return launcher
     }
 
+    /// What `importProgram` would copy for this EXE: the folder and the rule for names left out, or nil when the EXE
+    /// already lives inside a Wine environment and nothing is copied.
+    struct CopyPlan {
+        let folder: URL
+        let addon: Addon?
+        func excludes(_ item: URL) -> Bool { addon.map { $0.excludes(item) } ?? item.lastPathComponent.hasPrefix(".") }
+    }
+    func copyPlan(for exe: URL) -> CopyPlan? {
+        let file = exe.standardizedFileURL
+        if let addon = matchingAddon(file) { return CopyPlan(folder: file.deletingLastPathComponent(), addon: addon) }
+        if installedLocation(of: file) != nil { return nil }
+        return CopyPlan(folder: file.deletingLastPathComponent(), addon: nil)
+    }
+
+    struct FolderSurvey: Equatable {
+        var files = 0
+        var bytes: Int64 = 0
+        /// The walk stopped early, so both numbers are lower bounds.
+        var capped = false
+    }
+    /// Counts what a copy would take. Stops after `maxEntries` items or `maxSeconds`; meant for a background queue.
+    static func survey(_ folder: URL, excluding: (URL) -> Bool, maxEntries: Int = 100_000, maxSeconds: TimeInterval = 4) -> FolderSurvey {
+        var result = FolderSurvey()
+        let start = Date(), keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey]
+        guard let items = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: keys, options: [], errorHandler: { _, _ in true }) else { return result }
+        var seen = 0
+        for case let item as URL in items {
+            seen += 1
+            if seen > maxEntries || (seen % 256 == 0 && Date().timeIntervalSince(start) > maxSeconds) { result.capped = true; break }
+            guard let properties = try? item.resourceValues(forKeys: Set(keys)) else { continue }
+            if excluding(item) {
+                if properties.isDirectory == true { items.skipDescendants() }
+                continue
+            }
+            if properties.isDirectory == true || properties.isSymbolicLink == true { continue }
+            result.files += 1; result.bytes += Int64(properties.fileSize ?? 0)
+        }
+        return result
+    }
+
+    /// A warning when the folder to copy is the user's Downloads, Desktop, Documents or home folder itself.
+    static func broadFolderWarning(_ folder: URL, home: URL = FileManager.default.homeDirectoryForCurrentUser) -> String? {
+        let path = folder.standardizedFileURL.resolvingSymlinksInPath().path, base = home.standardizedFileURL.resolvingSymlinksInPath().path
+        let names = [base: "홈", base + "/Downloads": "다운로드", base + "/Desktop": "데스크탑", base + "/Documents": "문서"]
+        guard let name = names[path] else { return nil }
+        return "주의: 선택한 파일이 ‘\(name)’ 폴더 바로 아래에 있어 그 폴더 전체가 복사됩니다. 관련 없는 파일이 많다면 취소하고, 프로그램 전용 폴더로 옮긴 뒤 다시 선택해 주세요."
+    }
+
     /// The Wine environment and C:\ path of a file inside one of their C drives, or nil for any other file.
     func installedLocation(of file: URL) -> (environment: String?, path: String)? {
         let resolved = file.standardizedFileURL.resolvingSymlinksInPath().pathComponents

@@ -12,6 +12,8 @@ final class Session {
     var stopping = false
     /// Set when this run started a migration of the Wine environment to a new runtime build.
     var migrationRuntime: URL?
+    /// The status text shown while migrating, and the one that replaces it once the migration is over.
+    var migrationMessage = "", runningMessage = ""
     /// The migration is still under way (`.hadron-prefix-ready` is rewritten when it ends), so stopping now interrupts that update.
     var migrating: Bool {
         migrationRuntime.map { PrefixMigration.isMigrating(prefix: URL(fileURLWithPath: prefix), runtime: $0) } ?? false
@@ -42,17 +44,17 @@ enum LaunchDiagnostics {
     static let known: [(pattern: String, text: String)] = [
         ("watchdog: only .* of disk left", "디스크 여유 공간이 5GB 아래로 내려가 프로그램을 자동으로 멈췄습니다. 공간을 확보한 뒤(6GB 이상 권장) 다시 실행해 주세요."),
         ("watchdog: (critical memory pressure|swap grew|Wine resident memory)", "Mac의 메모리가 부족해질 수 있어 프로그램을 자동으로 멈췄습니다. 다른 앱을 종료해 메모리를 확보한 뒤 다시 실행해 주세요."),
-        ("runtime path too long", "실행 환경 경로가 너무 길어 Wine을 시작하지 못했습니다. 사용자 폴더 경로가 긴 Mac에서 생길 수 있습니다. 앱을 최신 버전으로 바꿔 보고, 계속되면 이 로그를 개발자에게 알려 주세요."),
+        ("runtime path too long", "런타임 경로가 너무 길어 Wine을 시작하지 못했습니다. 사용자 폴더 경로가 긴 Mac에서 생길 수 있습니다. 앱을 최신 버전으로 바꿔 보고, 계속되면 이 로그를 개발자에게 알려 주세요."),
         ("scope mismatch", "이 Wine 환경의 세션 정보가 맞지 않아 시작하지 못했습니다. 앱을 완전히 종료한 뒤 다시 실행해 주세요."),
-        ("runtime selection lock failed", "실행 환경을 고르는 중 잠금을 얻지 못했습니다. 다른 Alchemac 작업이 끝난 뒤 다시 시도해 주세요."),
+        ("runtime selection lock failed", "런타임을 고르는 중 잠금을 얻지 못했습니다. 다른 Alchemac 작업이 끝난 뒤 다시 시도해 주세요."),
         ("existing unmanaged Wine session", "이 Wine 환경에 앱이 관리하지 않는 Wine 프로세스가 남아 있습니다. 그 프로그램을 종료하거나 Mac을 다시 시작한 뒤 실행해 주세요."),
-        ("prefix migration incomplete", "새 실행 환경으로 옮기는 작업이 중간에 멈춘 환경입니다. 프로그램을 다시 실행하면 ‘다시 시도’ 또는 ‘업데이트 전 상태로 복원’을 고르는 창이 나옵니다. 환경 폴더 옆의 ‘.backup.’ 이름 폴더가 이전 상태의 복사본입니다."),
+        ("prefix migration incomplete", "Wine 환경을 새 런타임에 맞추는 작업이 중간에 멈춘 환경입니다. 프로그램을 다시 실행하면 ‘다시 시도’ 또는 ‘업데이트 전 상태로 복원’을 고르는 창이 나옵니다. 환경 폴더 옆의 ‘.backup.’ 이름 폴더가 이전 상태의 복사본입니다."),
         ("partial snapshot", "환경을 옮기기 전 복사본을 만들다 멈췄습니다. 디스크 여유 공간을 확인하고 다시 시도해 주세요."),
-        ("refusing an incomplete or foreign prefix", "이 Wine 환경이 완전하지 않거나 이 앱이 만든 환경이 아니어서 사용하지 않았습니다. 환경 초기화가 중간에 끊겼다면 그 환경 폴더를 지우고(휴지통) 다시 실행해 보세요."),
+        ("refusing an incomplete or foreign prefix", "이 Wine 환경을 안전하게 사용할 수 없어 실행하지 않았습니다. 환경이 완전하지 않거나 이 앱이 만든 환경이 아닙니다. 파일은 아무것도 바꾸거나 지우지 않았습니다. ‘환경 폴더 보기’로 폴더를 확인해 주세요."),
         ("initialization failed", "새 Wine 환경을 만들지 못했습니다. 디스크 여유 공간을 확인하고 다시 시도해 주세요."),
-        ("staging path already exists", "이전 환경 초기화가 남긴 임시 폴더가 있어 시작하지 못했습니다. 환경 폴더 옆의 ‘.hadron-new.’ 폴더를 휴지통으로 옮긴 뒤 다시 시도해 주세요."),
-        ("runtime has no BUILD-ID", "앱의 실행 환경 파일이 손상됐습니다. 앱을 다시 설치해 주세요."),
-        ("selected runtime has no entry point", "이 환경이 쓰는 실행 환경 사본이 손상됐습니다. 앱을 다시 설치해 주세요."),
+        ("staging path already exists", "이전 Wine 환경 초기화가 남긴 임시 폴더가 있어 실행하지 않았습니다. ‘환경 폴더 보기’로 같은 위치의 ‘.hadron-new.’ 폴더를 확인해 주세요. 무엇인지 확실하지 않으면 그대로 두고 로그와 함께 문의해 주세요."),
+        ("runtime has no BUILD-ID", "앱의 런타임 파일이 손상됐습니다. 앱을 다시 설치해 주세요."),
+        ("selected runtime has no entry point", "이 Wine 환경이 쓰는 런타임 사본이 손상됐습니다. 앱을 다시 설치해 주세요."),
         ("unsafe path", "경로에 사용할 수 없는 문자가 있습니다. 프로그램 폴더와 Wine 환경 이름을 확인해 주세요."),
         ("prefix symlinks are not accepted", "Wine 환경 폴더가 바로가기(링크)여서 사용할 수 없습니다."),
         ("EXE not found", "실행할 파일을 찾을 수 없습니다. 프로그램 폴더를 확인해 주세요."),
@@ -65,6 +67,20 @@ enum LaunchDiagnostics {
         ("font (copy|registry key|registry value) failed", "한글 글꼴을 환경에 설치하지 못했습니다. 디스크 여유 공간과 환경 상태를 확인해 주세요."),
         ("Windows directory failed", "Wine 환경의 Windows 폴더에 접근하지 못했습니다. 환경이 손상됐을 수 있습니다."),
     ]
+
+    /// Failures whose fix starts with looking at the Wine environment's folder ("환경 폴더 보기" in the window).
+    static let environmentFolderPatterns = ["refusing an incomplete or foreign prefix", "staging path already exists", "prefix migration incomplete", "Windows directory failed"]
+
+    static func wantsEnvironmentFolder(_ text: String) -> Bool {
+        environmentFolderPatterns.contains { text.range(of: $0, options: .regularExpression) != nil }
+    }
+
+    /// The status text once a migration has ended: the normal running text, keeping anything appended after the
+    /// migration notice. nil when the message is no longer the migration notice (something else replaced it).
+    static func settledMessage(current: String, migration: String, running: String) -> String? {
+        guard !migration.isEmpty, current.hasPrefix(migration) else { return nil }
+        return running + current.dropFirst(migration.count)
+    }
 
     /// How long after the supervisor's last log line the session may last for an early exit to count.
     static let quickEnd: TimeInterval = 20
@@ -247,6 +263,8 @@ final class SessionController: ObservableObject {
     @Published var message = "프로그램을 선택한 뒤 실행해 주세요."
     /// Logs of the last run that failed or ended at once, until another run starts.
     @Published private(set) var lastProblemLogs: [URL] = []
+    /// The Wine environment of that run when its failure points at the environment itself.
+    @Published private(set) var lastProblemPrefix: URL?
     /// Runs when the last session has ended.
     var finished: (() -> Void)?
     private let runtime: URL
@@ -324,16 +342,17 @@ final class SessionController: ObservableObject {
         }
     }
 
-    /// Set while the startup cleanup of leftover runtime copies runs; no session starts meanwhile.
-    var maintenance = false
+    /// Set while the startup cleanup of leftovers runs; no session starts meanwhile and the window says so.
+    @Published var maintenance = false
+    private var migrationPoll: Task<Void, Never>?
 
     private func start(id: String?, title: String, running: String, then: (() -> Void)? = nil, configure: (Process) throws -> Void) throws {
-        if maintenance { throw AlchemacError.message("앱이 이전 실행 환경 사본을 정리하는 중입니다. 잠시 후 다시 실행해 주세요.") }
+        if maintenance { throw AlchemacError.message("앱이 보관함을 준비하는 중입니다. 잠시 후 다시 실행해 주세요.") }
         let next = Process()
         try configure(next) // computes the process only; no filesystem change yet
         let prefix = URL(fileURLWithPath: next.environment!["WINEPREFIX"]!).standardizedFileURL.path
         if let current = sessions[prefix] {
-            throw AlchemacError.message("같은 Wine 환경에서 ‘\(current.title)’이(가) 실행 중입니다. 먼저 종료하거나, 이 프로그램을 전용 Wine 환경에 두면 동시에 실행할 수 있습니다.")
+            throw AlchemacError.message("같은 Wine 환경에서 실행 중인 프로그램이 있습니다: ‘\(current.title)’. 먼저 종료하거나, 이 프로그램을 전용 Wine 환경에 두면 동시에 실행할 수 있습니다.")
         }
         let prefixURL = URL(fileURLWithPath: prefix, isDirectory: true)
         // Not one of this run's sessions, yet the lock is held: a supervisor an earlier run of the app left behind.
@@ -367,11 +386,40 @@ final class SessionController: ObservableObject {
             throw error
         }
         session.after = then
-        if migrating { session.migrationRuntime = runtime }
-        lastProblemLogs = []
+        session.runningMessage = running
+        if migrating {
+            session.migrationRuntime = runtime
+            session.migrationMessage = "\(title) 실행 준비 중 · 앱 업데이트 후 첫 실행이라 Wine 환경을 새 버전에 맞추고 있습니다. 몇 분 걸릴 수 있으니 끝날 때까지 종료하지 마세요."
+        }
+        lastProblemLogs = []; lastProblemPrefix = nil
         sessions[prefix] = session
-        message = migrating ? "\(title) 실행 준비 중 · 앱 업데이트 후 첫 실행이라 Wine 환경을 새 버전에 맞추고 있습니다. 몇 분 걸릴 수 있으니 끝날 때까지 종료하지 마세요." : running
+        message = migrating ? session.migrationMessage : running
         if resetCopy { message += "\n" + RuntimeCopy.resetNotice }
+        if migrating { watchMigrations() }
+    }
+
+    /// While some session is migrating its Wine environment, looks every 2 s whether that is over.
+    private func watchMigrations() {
+        guard migrationPoll == nil else { return }
+        migrationPoll = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard let self else { return }
+                if !self.checkMigrations() { self.migrationPoll = nil; return }
+            }
+        }
+    }
+
+    /// Ends the "do not quit" notice of every session whose migration is over. Returns whether any is still migrating.
+    @discardableResult
+    func checkMigrations() -> Bool {
+        var pending = false
+        for session in sessions.values where session.migrationRuntime != nil {
+            if session.migrating { pending = true; continue }
+            if let text = LaunchDiagnostics.settledMessage(current: message, migration: session.migrationMessage, running: session.runningMessage) { message = text }
+            session.migrationRuntime = nil
+        }
+        return pending
     }
 
     private func ended(_ child: Process, prefix: String) {
@@ -392,7 +440,11 @@ final class SessionController: ObservableObject {
         default:
             message = "\(session.title): 실행이 종료됐습니다 (코드 \(status))." + (reason.map { "\n" + $0 } ?? " 진단 로그를 확인해 주세요.")
         }
-        if !stopped, status != 0 || reason != nil { lastProblemLogs = [session.runtimeLog, session.outerLog].compactMap { $0 } }
+        if !stopped, status != 0 || reason != nil {
+            lastProblemLogs = [session.runtimeLog, session.outerLog].compactMap { $0 }
+            let logText = LaunchDiagnostics.tail(session.outerLog) + "\n" + (session.runtimeLog.map { LaunchDiagnostics.tail($0) } ?? "")
+            lastProblemPrefix = LaunchDiagnostics.wantsEnvironmentFolder(logText) ? URL(fileURLWithPath: prefix, isDirectory: true) : nil
+        }
         session.after?()
         if sessions.isEmpty { finished?() }
     }

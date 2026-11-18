@@ -408,12 +408,12 @@ enum RuntimeCopy {
         return try PrefixMigration.withEnvironmentFree(prefix) {
             guard let problem = verify(copy: copy, bundle: runtime) else { return nil }
             do { try FileManager.default.removeItem(at: copy) } catch {
-                throw AlchemacError.message("이 환경의 실행 환경 사본에서 바뀐 파일이 발견됐지만(\(problem.reason)) 사본을 초기화하지 못해 실행하지 않았습니다. 앱을 다시 설치한 뒤에도 같으면 ‘\(copy.deletingLastPathComponent().deletingLastPathComponent().path)’ 폴더를 휴지통으로 옮겨 주세요. (\(error.localizedDescription))")
+                throw AlchemacError.message("이 Wine 환경에서 쓰는 런타임 사본이 바뀌어 있지만(\(problem.reason)) 사본을 초기화하지 못해 실행하지 않았습니다. 앱을 다시 설치한 뒤에도 같으면 ‘\(copy.deletingLastPathComponent().deletingLastPathComponent().path)’ 폴더를 휴지통으로 옮겨 주세요. (\(error.localizedDescription))")
             }
             FileHandle.standardError.write(Data("alchemac: runtime copy reset (\(problem.reason)): \(copy.path)\n".utf8))
             return problem.reason
         }
     }
 
-    static let resetNotice = "이 환경의 실행 환경 사본에서 바뀐 파일이 발견돼 새로 만들었습니다. 최근에 실행한 Windows 프로그램을 확인해 주세요."
+    static let resetNotice = "이 Wine 환경에서 쓰는 런타임 사본이 바뀌어 있어 새로 만들었습니다. 예상하지 못한 변경이라면 최근에 실행한 프로그램을 확인해 주세요."
 }

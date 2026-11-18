@@ -176,13 +176,24 @@ enum Updater {
         return data
     }
 
-    /// The manifest of a newer release this Mac can run, or nil.
-    static func checkForUpdate(currentBuild: Int) async throws -> UpdateManifest? {
+    /// What a check found. `needsSystem` carries the macOS version a newer build asks for.
+    enum Check: Equatable {
+        case upToDate
+        case available(UpdateManifest)
+        case needsSystem(String)
+    }
+
+    static func classify(_ manifest: UpdateManifest, currentBuild: Int, system: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion) -> Check {
+        guard isNewer(build: manifest.build, than: currentBuild) else { return .upToDate }
+        return systemMeets(manifest.minimumSystem, current: system) ? .available(manifest) : .needsSystem(manifest.minimumSystem)
+    }
+
+    static func checkForUpdate(currentBuild: Int) async throws -> Check {
         let base = UpdateFeed.feedBase()
         let data = try await fetch(base.appendingPathComponent("update.json"), limit: 16 << 20)
         let signature = try await fetch(base.appendingPathComponent("update.json.sig"), limit: 4096)
         let manifest = try verifiedManifest(data: data, signature: signature, publicKey: UpdateFeed.publicKey)
-        return isNewer(build: manifest.build, than: currentBuild) && systemMeets(manifest.minimumSystem) ? manifest : nil
+        return classify(manifest, currentBuild: currentBuild)
     }
 
     // MARK: Settings
@@ -440,25 +451,51 @@ enum Updater {
 
     static let helperScript = """
     #!/bin/sh
-    # Alchemac update helper. Arguments: pid app staging backup [--no-open]. Paths are never part of this text.
-    pid="$1"; app="$2"; staging="$3"; backup="$4"; mode="$5"
+    # Alchemac update helper. Arguments: pid app staging backup result target [--no-open]. Paths are never part of this text.
+    # `result` receives target=<build> and outcome=installed|restored|not-started for the next launch to report.
+    pid="$1"; app="$2"; staging="$3"; backup="$4"; result="$5"; target="$6"; mode="$7"
     reopen() { [ "$mode" = "--no-open" ] || /usr/bin/open "$1"; }
+    finish() { printf 'target=%s\\noutcome=%s\\n' "$target" "$1" > "$result.tmp" && /bin/mv -f "$result.tmp" "$result"; }
     tries=0
     while kill -0 "$pid" 2>/dev/null; do
       tries=$((tries + 1))
-      [ "$tries" -gt 600 ] && exit 1
+      [ "$tries" -gt 600 ] && { finish not-started; exit 1; }
       sleep 0.2
     done
-    [ -d "$staging" ] || { reopen "$app"; exit 1; }
-    if ! /bin/mv "$app" "$backup"; then reopen "$app"; exit 1; fi
+    [ -d "$staging" ] || { finish not-started; reopen "$app"; exit 1; }
+    if ! /bin/mv "$app" "$backup"; then finish not-started; reopen "$app"; exit 1; fi
     if ! /bin/mv "$staging" "$app"; then
       /bin/mv "$backup" "$app"
+      finish restored
       reopen "$app"
       exit 1
     fi
+    finish installed
     reopen "$app"
 
     """
+
+    /// What the helper recorded about the last install attempt; the file is read once and removed.
+    static func takeInstallResult(updates: URL = updatesFolder) -> (target: Int, outcome: String)? {
+        let file = updates.appendingPathComponent("last-install.txt")
+        defer { try? FileManager.default.removeItem(at: file) }
+        guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]), values.isRegularFile == true, (values.fileSize ?? 0) < 4096,
+              let text = try? String(contentsOf: file, encoding: .utf8) else { return nil }
+        var fields: [String: String] = [:]
+        for line in text.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: "=", maxSplits: 1).map(String.init)
+            if parts.count == 2 { fields[parts[0]] = parts[1] }
+        }
+        guard let target = fields["target"].flatMap({ Int($0) }), let outcome = fields["outcome"] else { return nil }
+        return (target, outcome)
+    }
+
+    enum InstallReport: Equatable { case installed, failed(outcome: String) }
+
+    /// "installed" only counts when the running build really is the target; anything else means the old version is still here.
+    static func installReport(_ result: (target: Int, outcome: String), runningBuild: Int) -> InstallReport {
+        result.outcome == "installed" && result.target == runningBuild ? .installed : .failed(outcome: result.outcome)
+    }
 
     static func backupURL(oldVersion: String, updates: URL) -> URL {
         let previous = updates.appendingPathComponent("previous", isDirectory: true)
@@ -472,18 +509,20 @@ enum Updater {
 
     /// Starts the helper that swaps the apps once this process has exited. The caller terminates the app afterwards.
     /// `waitFor`/`open` exist for tests: the pid to wait for, and false to skip the final `open`.
-    static func installAndRelaunch(staging: URL, app: URL, oldVersion: String, updates: URL = updatesFolder,
+    static func installAndRelaunch(staging: URL, app: URL, oldVersion: String, targetBuild: Int, updates: URL = updatesFolder,
                                    waitFor pid: Int32 = getpid(), open: Bool = true, wait: Bool = false) throws {
         let fm = FileManager.default
         do {
             try fm.createDirectory(at: updates.appendingPathComponent("previous", isDirectory: true), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             let script = updates.appendingPathComponent("install-helper.sh")
             try? fm.removeItem(at: script)
+            try? fm.removeItem(at: updates.appendingPathComponent("last-install.txt"))
             try Data(helperScript.utf8).write(to: script)
             try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/sh")
-            process.arguments = [script.path, String(pid), app.path, staging.path, backupURL(oldVersion: oldVersion, updates: updates).path] + (open ? [] : ["--no-open"])
+            process.arguments = [script.path, String(pid), app.path, staging.path, backupURL(oldVersion: oldVersion, updates: updates).path,
+                                 updates.appendingPathComponent("last-install.txt").path, String(targetBuild)] + (open ? [] : ["--no-open"])
             process.standardInput = FileHandle.nullDevice; process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
             try process.run()
             if wait { process.waitUntilExit(); if process.terminationStatus != 0 { throw UpdateError.install("helper exit \(process.terminationStatus)") } }

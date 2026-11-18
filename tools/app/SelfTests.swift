@@ -56,6 +56,22 @@ struct SelfTests {
         try check(!fm.fileExists(atPath: game.appendingPathComponent(".hidden").path), "import excludes hidden files")
         try check(fm.fileExists(atPath: game.appendingPathComponent("Game_Data/keep.dat").path), "file exclusion preserves the next directory's assets")
         try check(try Data(contentsOf: source.appendingPathComponent("account.txt")) == Data("account-secret".utf8), "source account unchanged")
+        // The confirmation before a copy counts what the copy takes.
+        let copyPlan = store.copyPlan(for: source.appendingPathComponent("GameLauncher.exe"))
+        try check(copyPlan?.addon?.id == "sample" && copyPlan?.folder.path == source.standardizedFileURL.path, "an add-on EXE is planned as a folder copy")
+        var copiedFiles = 0, copiedBytes: Int64 = 0
+        for case let item as URL in fm.enumerator(at: game, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey])! {
+            let values = try item.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            if values.isRegularFile == true { copiedFiles += 1; copiedBytes += Int64(values.fileSize ?? 0) }
+        }
+        let surveyed = LauncherStore.survey(source, excluding: copyPlan!.excludes)
+        try check(surveyed == LauncherStore.FolderSurvey(files: copiedFiles, bytes: copiedBytes, capped: false), "the survey matches what the import copied")
+        try check(LauncherStore.survey(source, excluding: { _ in false }, maxEntries: 1).capped, "a survey over its cap says so")
+        try check(store.copyPlan(for: store.sharedPrefix.appendingPathComponent("drive_c/Program Files/App/app.exe")) == nil, "an EXE inside a Wine environment copies nothing")
+        let fakeHome = temp.appendingPathComponent("fake-home")
+        for name in ["Downloads/Game", "Desktop", "Documents", "Other"] { try fm.createDirectory(at: fakeHome.appendingPathComponent(name), withIntermediateDirectories: true) }
+        try check(["", "Downloads", "Desktop", "Documents"].allSatisfy { LauncherStore.broadFolderWarning(fakeHome.appendingPathComponent($0), home: fakeHome)?.contains("전체가 복사됩니다") == true }
+                  && ["Downloads/Game", "Other"].allSatisfy { LauncherStore.broadFolderWarning(fakeHome.appendingPathComponent($0), home: fakeHome) == nil }, "Downloads, Desktop, Documents and home warn; a program folder does not")
         imported.name = "Quoted \" launcher 한글"
         try store.write(Registry(selectedID: imported.id, launchers: [imported]))
         try check(try store.read().launchers.first == imported, "registry persists selection and Unicode name")
@@ -105,6 +121,12 @@ struct SelfTests {
                   && !demo.excludes(URL(fileURLWithPath: "/x/data.bin")), "exclusion patterns match names and extensions")
         let upgraded = try store.installAddon(from: try manifest(#"{"schema":1,"id":"demo","name":"Demo","version":"2.0","detect":{"executable":"demo.exe"}}"#))
         try check(upgraded.version == "2.0" && store.addon("demo")?.version == "2.0", "installing again replaces the add-on")
+        try check(store.addonExists("demo") && !store.addonExists("nothing-here") && (try store.readAddon(from: try manifest(#"{"schema":1,"id":"nothing-here","name":"N","version":"1","detect":{"executable":"n.exe"}}"#)).addon.id) == "nothing-here"
+                  && !store.addonExists("nothing-here"), "reading an add-on installs nothing and tells whether its id exists")
+        do { _ = try store.readAddon(from: try manifest("{ not json")); try check(false, "broken JSON is rejected") }
+        catch { try check(error.localizedDescription == "애드온 설정 파일을 읽지 못했습니다. 애드온을 다시 받아 설치해 주세요.", "broken add-on JSON gets the plain message") }
+        do { _ = try store.readAddon(from: try manifest(#"{"schema":2,"id":"demo","name":"Demo","version":"1","detect":{"executable":"demo.exe"}}"#)); try check(false, "a newer schema is rejected") }
+        catch { try check(error.localizedDescription == "이 애드온 형식을 지원하지 않습니다. 최신 Alchemac에서 다시 시도해 주세요.", "an unknown add-on schema gets the plain message") }
         var orphan = imported; orphan.addon = "missing"
         try rejects("program refuses to run without its add-on") { try AlchemacRuntime.configure(Process(), launcher: orphan, store: store, runtime: mock, resources: resources) }
         try check(Launcher.validExecutable("C:\\Program Files\\Origin\\Origin64.exe", kind: .installed), "installed program C: path accepted")
@@ -360,6 +382,15 @@ struct SelfTests {
         try installScript("exit 0")
         try quiet.start(copied, store: store)
         try check(spin { !quiet.busy } && quiet.message.hasSuffix("세션이 종료됐습니다.") && quiet.lastProblemLogs.isEmpty, "ordinary exit shows no problem")
+        let broken = SessionController(runtime: refuseRuntime)
+        try installScript("echo 'prefix-profile: refusing an incomplete or foreign prefix' >&2; exit 1")
+        try broken.start(copied, store: store)
+        try check(spin { !broken.busy } && broken.lastProblemPrefix != nil && !broken.message.contains("폴더를 지우") && broken.message.contains("안전하게 사용할 수 없어"), "an unusable environment offers its folder instead of telling the user to delete it")
+        try check(refused.lastProblemPrefix == nil && LaunchDiagnostics.wantsEnvironmentFolder("x staging path already exists y") && !LaunchDiagnostics.wantsEnvironmentFolder("EXE not found"), "only environment problems point at the environment folder")
+        let migratingText = "A 실행 준비 중 · 종료하지 마세요."
+        try check(LaunchDiagnostics.settledMessage(current: migratingText + "\n추가", migration: migratingText, running: "A 실행 중") == "A 실행 중\n추가"
+                  && LaunchDiagnostics.settledMessage(current: "다른 메시지", migration: migratingText, running: "A 실행 중") == nil
+                  && LaunchDiagnostics.settledMessage(current: "x", migration: "", running: "y") == nil, "the migration notice is replaced by the running text once it is over")
         var scaledLab = labProgram; scaledLab.scaled = true
         try store.write(Registry(selectedID: labProgram.id, launchers: [imported, scaledLab, isolatedCopy]))
         try check(try store.read().launchers.map(\.scaled) == [false, true, false], "registry persists size correction")
@@ -1000,18 +1031,40 @@ struct SelfTests {
             try file(installed.appendingPathComponent("Contents/marker"), "old")
             try file(stage.appendingPathComponent("Contents/marker"), "new")
             let gone = Process(); gone.executableURL = URL(fileURLWithPath: "/usr/bin/true"); try gone.run(); gone.waitUntilExit()
-            try Updater.installAndRelaunch(staging: stage, app: installed, oldVersion: "0.5.12", updates: updates, waitFor: gone.processIdentifier, open: false, wait: true)
+            try Updater.installAndRelaunch(staging: stage, app: installed, oldVersion: "0.5.12", targetBuild: 36, updates: updates, waitFor: gone.processIdentifier, open: false, wait: true)
             let backup = updates.appendingPathComponent("previous/Alchemac-0.5.12.app")
             try check((try? String(contentsOf: installed.appendingPathComponent("Contents/marker"), encoding: .utf8)) == "new"
                       && (try? String(contentsOf: backup.appendingPathComponent("Contents/marker"), encoding: .utf8)) == "old"
                       && !fm.fileExists(atPath: stage.path), "the helper swaps the apps and keeps the old one as a backup")
+            let installedResult = Updater.takeInstallResult(updates: updates)
+            try check(installedResult?.target == 36 && installedResult?.outcome == "installed", "the helper records a successful install with the target build")
+            try check(Updater.takeInstallResult(updates: updates) == nil && !fm.fileExists(atPath: updates.appendingPathComponent("last-install.txt").path), "the result is read once and removed")
+            try check(Updater.installReport((36, "installed"), runningBuild: 36) == .installed
+                      && Updater.installReport((36, "installed"), runningBuild: 35) == .failed(outcome: "installed")
+                      && Updater.installReport((36, "restored"), runningBuild: 35) == .failed(outcome: "restored")
+                      && Updater.installReport((36, "not-started"), runningBuild: 36) == .failed(outcome: "not-started"), "only an installed result with the matching build counts as success")
             try check(Updater.backupURL(oldVersion: "0.5.12", updates: updates).lastPathComponent == "Alchemac-0.5.12-2.app", "an existing backup name gets a numeric suffix")
             try check((try? String(contentsOf: updates.appendingPathComponent("install-helper.sh"), encoding: .utf8))?.contains(installed.path) == false, "paths are arguments, never part of the helper script")
             // A missing staging folder changes nothing.
             try rejects("the helper leaves the app alone when the staging folder is missing") {
-                try Updater.installAndRelaunch(staging: stage, app: installed, oldVersion: "0.5.13", updates: updates, waitFor: gone.processIdentifier, open: false, wait: true)
+                try Updater.installAndRelaunch(staging: stage, app: installed, oldVersion: "0.5.13", targetBuild: 37, updates: updates, waitFor: gone.processIdentifier, open: false, wait: true)
             }
             try check((try? String(contentsOf: installed.appendingPathComponent("Contents/marker"), encoding: .utf8)) == "new", "the app is unchanged after a refused swap")
+            let failedResult = Updater.takeInstallResult(updates: updates)
+            try check(failedResult?.target == 37 && failedResult?.outcome == "not-started", "the helper records a missing staging folder as not-started")
+            try check(Updater.takeInstallResult(updates: temp.appendingPathComponent("no-updates")) == nil, "no result file means nothing to report")
+            try file(updates.appendingPathComponent("last-install.txt"), "target=abc\noutcome=installed\n")
+            try check(Updater.takeInstallResult(updates: updates) == nil, "a malformed result is ignored and removed")
+
+            // Check results: up to date, available, or newer but needing a newer macOS.
+            let sys27 = OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0)
+            let newer = manifest
+            try check(Updater.classify(newer, currentBuild: newer.build, system: sys27) == .upToDate
+                      && Updater.classify(newer, currentBuild: newer.build - 1, system: sys27) == .available(newer), "a check tells up to date from available")
+            let tooNew = UpdateManifest(schema: newer.schema, bundleID: newer.bundleID, version: newer.version, build: newer.build, minimumSystem: "28.1", releaseURL: newer.releaseURL,
+                                        dmg: newer.dmg, deltas: newer.deltas, entries: newer.entries)
+            try check(Updater.classify(tooNew, currentBuild: newer.build - 1, system: sys27) == .needsSystem("28.1")
+                      && Updater.classify(tooNew, currentBuild: newer.build, system: sys27) == .upToDate, "a newer build that needs a newer macOS is reported as such")
 
             // Launch cleanup: finished download folders and stale staging go; the Trash is not touched (no previous apps here).
             let cleanUpdates = temp.appendingPathComponent("clean-updates"), cleanParent = temp.appendingPathComponent("clean-parent")
