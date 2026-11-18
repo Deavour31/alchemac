@@ -17,6 +17,7 @@ HADRON = ROOT / 'src/hadron'
 HADRON_BASE = '2faae2af7dbcd0b6448bea5c86c20c33548a792c'
 # Spelled in pieces so this file does not match its own check.
 PROGRAM_NAMES = 'dur' + 'ango|듀' + '랑고'
+AI_TOOL_NAMES = ('co-auth' + 'ored-by|clau' + 'de-session|clau' + r'de\.ai|anthr' + 'opic|generated with \\[?clau' + r'de|\b' + 'cod' + r'ex\b')
 
 FILES = {
     'README.md': 'app/alchemac/README.md',
@@ -118,6 +119,8 @@ def scan(folder):
         # Program-specific support ships as add-ons, never in the app repository.
         if re.search(PROGRAM_NAMES, text, re.I):
             problems.append(f'{path.relative_to(folder)}: names a specific program')
+        if re.search(AI_TOOL_NAMES, text, re.I):
+            problems.append(f'{path.relative_to(folder)}: mentions an AI tool')
         if uuid.search(text):
             problems.append(f'{path.relative_to(folder)}: contains a UUID')
     return problems

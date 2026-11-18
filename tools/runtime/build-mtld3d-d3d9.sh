@@ -63,11 +63,15 @@ cat > "$OUT/ecshim/ec-pre.h" <<'HDR'
 HDR
 export CARGO_TARGET_DIR="$OUT/windows" CFLAGS="-DNDEBUG" CXXFLAGS="-DNDEBUG"
 arm64_cxx='-fno-exceptions -fno-rtti -fno-threadsafe-statics -DSNMALLOC_USE_THREAD_CLEANUP -DARM64_SYSREG(op0,op1,crn,crm,op2)=((((op0)&1)<<14)|(((op1)&7)<<11)|(((crn)&15)<<7)|(((crm)&15)<<3)|((op2)&7))'
+# Keep build-host paths out of the DLLs: REMAP covers rustc panic messages, CMAP covers C/C++
+# __FILE__ paths (snmalloc via the cc crate), and /pdbaltpath below covers the CodeView PDB path.
+REMAP="--remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$SRC=/src"
+CMAP="-ffile-prefix-map=$HOME/.cargo=/cargo -ffile-prefix-map=$SRC=/src"
 cd "$SRC/windows"
 for target in aarch64-pc-windows-msvc arm64ec-pc-windows-msvc; do
   mt=${target%%-*}-w64-mingw32; inc="--target=$mt"; cxxinc="--target=$mt -include stdlib.h"
   [[ $target == arm64ec* ]] && cxxinc="$cxxinc -include $OUT/ecshim/ec-pre.h"
-  env RUSTFLAGS="-C target-feature=-crt-static" "CFLAGS_$target=$inc" "CXXFLAGS_$target=$arm64_cxx $cxxinc" \
+  env RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-feature=-crt-static $REMAP" "CFLAGS_$target=$inc $CMAP" "CXXFLAGS_$target=$arm64_cxx $cxxinc $CMAP" \
       "AR_$target=llvm-lib" "CC_$target=$MINGW/bin/clang" "CXX_$target=$MINGW/bin/clang++" \
       "ARFLAGS_arm64ec-pc-windows-msvc=-machine:arm64ec" \
       cargo +stable rustc --profile "$PROFILE" --target "$target" -p d3d9 --crate-type staticlib
@@ -83,7 +87,7 @@ for l in mingw32 mingwex ucrt kernel32 mincore user32 advapi32 gdi32 ws2_32 user
   libs+=("$MINGW/aarch64-w64-mingw32/lib/lib$l.a")
 done
 "$LLD_LINK" -lldmingw /dll /machine:arm64x /nodefaultlib /opt:ref,icf /entry:DllMainCRTStartup \
-  /def:"$SRC/windows/d3d9/d3d9.def" /defarm64native:"$SRC/windows/d3d9/d3d9.def" /debug /pdb:"$X/d3d9.pdb" /out:"$X/d3d9.dll" \
+  /def:"$SRC/windows/d3d9/d3d9.def" /defarm64native:"$SRC/windows/d3d9/d3d9.def" /debug /pdb:"$X/d3d9.pdb" /pdbaltpath:d3d9.pdb /out:"$X/d3d9.dll" \
   "$MINGW/aarch64-w64-mingw32/lib/dllcrt2.o" "$A/d3d9.lib" "$E/d3d9.lib" "${libs[@]}" \
   "$MINGW"/lib/clang/*/lib/windows/libclang_rt.builtins-aarch64.a
 ls -l "$X/d3d9.dll"; shasum -a 256 "$X/d3d9.dll"
@@ -92,9 +96,9 @@ ls -l "$X/d3d9.dll"; shasum -a 256 "$X/d3d9.dll"
 # ---- i686 (32-bit) DLL, mingw CRT ----
 t=i686-pc-windows-msvc; mt=i686-w64-mingw32
 I=$OUT/windows/$t/$PROFILE X86=$OUT/windows/i686/$PROFILE
-env RUSTFLAGS="-C target-cpu=pentium4 -C target-feature=-crt-static --cfg mtld3d_mingw_crt" \
-    "CFLAGS_$t=--target=$mt -march=pentium4 -fno-omit-frame-pointer" \
-    "CXXFLAGS_$t=--target=$mt -march=pentium4 -fno-omit-frame-pointer -include stdlib.h -fno-exceptions -fno-rtti -fno-threadsafe-statics -DSNMALLOC_USE_THREAD_CLEANUP" \
+env RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=pentium4 -C target-feature=-crt-static --cfg mtld3d_mingw_crt $REMAP" \
+    "CFLAGS_$t=--target=$mt -march=pentium4 -fno-omit-frame-pointer $CMAP" \
+    "CXXFLAGS_$t=--target=$mt -march=pentium4 -fno-omit-frame-pointer -include stdlib.h -fno-exceptions -fno-rtti -fno-threadsafe-statics -DSNMALLOC_USE_THREAD_CLEANUP $CMAP" \
     "AR_$t=llvm-lib" "CC_$t=$MINGW/bin/clang" "CXX_$t=$MINGW/bin/clang++" \
     cargo +stable rustc --profile "$PROFILE" --target "$t" -p d3d9 --crate-type staticlib
 syms=$(llvm-nm "$I/d3d9.lib" 2>/dev/null)
@@ -109,7 +113,7 @@ for l in mingw32 mingwex ucrt kernel32 mincore user32 advapi32 gdi32 ws2_32 user
   libs+=("$MINGW/$mt/lib/lib$l.a")
 done
 "$LLD_LINK" -lldmingw /dll /machine:x86 /nodefaultlib /opt:ref,icf /entry:DllMainCRTStartup@12 \
-  /def:"$SRC/windows/d3d9/d3d9.def" /debug /pdb:"$X86/d3d9.pdb" /out:"$X86/d3d9.dll" \
+  /def:"$SRC/windows/d3d9/d3d9.def" /debug /pdb:"$X86/d3d9.pdb" /pdbaltpath:d3d9.pdb /out:"$X86/d3d9.dll" \
   "$MINGW/$mt/lib/dllcrt2.o" "$I/d3d9.lib" "$OUT/ntdll-msvc-helpers.lib" "${libs[@]}" \
   "$MINGW"/lib/clang/*/lib/windows/libclang_rt.builtins-i386.a
 ls -l "$X86/d3d9.dll"; shasum -a 256 "$X86/d3d9.dll"

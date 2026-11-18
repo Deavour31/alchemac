@@ -7,7 +7,7 @@ tools/runtime/build-mtld3d-d3d9.sh. mtld3d.dll and mtld3d.so stay as in the base
 
 Run with `python3 -I`.
 
-Usage: patch-mtld3d-d3d9.py [--i386 <i386-d3d9.dll>] <base-runtime> <new-runtime> <d3d9.dll> <patch>...
+Usage: patch-mtld3d-d3d9.py [--i386 <i386-d3d9.dll>] [--reason <text>] <base-runtime> <new-runtime> <d3d9.dll> <patch>...
 Keep <new-runtime> SHORT (e.g. 0.3.0-ac6, never base-id plus suffix): the runtime root is limited to 180 characters.
 
 The base runtime folder is cloned (APFS clone, `cp -c -R`) to the new folder (which must
@@ -18,6 +18,14 @@ i386 for --i386, and containing "mtld3d") and so is the base's existing ARM64X D
 anything is written. The i386 DLL of the base may be the shipped one or an earlier mingw-CRT
 build; its old and new sha256 are recorded.
 Scripts are not touched, so ADAPTER.json stays valid.
+
+Rebuilding on an already patched runtime: the base is also accepted when it has an
+MTLD3D-PATCH.json and its aarch64 d3d9.dll sha256 equals that JSON's patched_d3d9_aarch64_sha256.
+Then the new MTLD3D-PATCH.json keeps the base JSON's original_d3d9_*_sha256 (the true upstream
+originals), records the base DLLs as previous_patched_d3d9_{aarch64,i386}_sha256 and, with
+--reason <text>, rebuild_reason. Old "d3d9 (aarch64|i386) rebuilt" lines of VERSION are dropped
+before the new ones are appended. If the base has BUILD-LINEAGE.json it is copied with the new
+build appended (build_id updated, entry added to "lineage" and "rebuilds").
 """
 import hashlib, json, os, struct, subprocess, sys
 from pathlib import Path
@@ -52,10 +60,14 @@ def check_dll(d, want=MACHINE_ARM64):
 def main():
     args = sys.argv[1:]
     dll32 = None
-    if args and args[0] == '--i386':
+    reason = None
+    while args and args[0] in ('--i386', '--reason'):
         if len(args) < 2:
             raise SystemExit(__doc__)
-        dll32 = Path(args[1]).resolve()
+        if args[0] == '--i386':
+            dll32 = Path(args[1]).resolve()
+        else:
+            reason = args[1]
         args = args[2:]
     if len(args) < 4:
         raise SystemExit(__doc__)
@@ -70,8 +82,13 @@ def main():
             raise SystemExit('patch not found: %s' % p)
     old = (base / REL).read_bytes()
     old_sha = sha(old)
-    if old_sha != ORIG_SHA:
-        raise SystemExit('refusing: base d3d9.dll sha256 %s is not the expected %s' % (old_sha, ORIG_SHA))
+    base_info = None
+    if (base / 'MTLD3D-PATCH.json').is_file():
+        base_info = json.loads((base / 'MTLD3D-PATCH.json').read_text())
+    if old_sha != ORIG_SHA and not (base_info and old_sha == base_info.get('patched_d3d9_aarch64_sha256')):
+        raise SystemExit('refusing: base d3d9.dll sha256 %s is neither the original %s nor the patched sha256 recorded in its MTLD3D-PATCH.json'
+                         % (old_sha, ORIG_SHA))
+    rebuild = old_sha != ORIG_SHA
     data = dll.read_bytes()
     try:
         check_dll(data)
@@ -106,6 +123,9 @@ def main():
     text = ver.read_text()
     if text and not text.endswith('\n'):
         text += '\n'
+    if rebuild:
+        text = ''.join(l for l in text.splitlines(True)
+                       if not l.startswith(('d3d9 (aarch64) rebuilt', 'd3d9 (i386) rebuilt')))
     text += 'd3d9 (aarch64) rebuilt with patches: %s\n' % ', '.join(names)
     if data32 is not None:
         text += 'd3d9 (i386) rebuilt against the mingw CRT with patches: %s\n' % ', '.join(names)
@@ -127,12 +147,33 @@ def main():
         'i386_d3d9_unchanged': data32 is None,
         'i386_d3d9_sha256': sha((new / REL_I386).read_bytes()),
     }
+    if rebuild:
+        info['original_d3d9_aarch64_sha256'] = base_info.get('original_d3d9_aarch64_sha256', ORIG_SHA)
+        info['previous_patched_d3d9_aarch64_sha256'] = old_sha
+        info['previous_patched_d3d9_i386_sha256'] = old32_sha
+        if base_info.get('original_d3d9_i386_sha256'):
+            info['original_d3d9_i386_sha256'] = base_info['original_d3d9_i386_sha256']
+        if reason:
+            info['rebuild_reason'] = reason
     if data32 is not None:
-        info['original_d3d9_i386_sha256'] = old32_sha
+        if not (rebuild and base_info.get('original_d3d9_i386_sha256')):
+            info['original_d3d9_i386_sha256'] = old32_sha
         info['patched_d3d9_i386_sha256'] = sha(data32)
         info['i386_crt'] = 'llvm-mingw (built by build-mtld3d-d3d9.sh; upstream uses the MSVC CRT)'
         info['modified_runtime_files'].insert(1, REL_I386)
     (new / 'MTLD3D-PATCH.json').write_text(json.dumps(info, indent=2, ensure_ascii=False) + '\n')
+    lin = base / 'BUILD-LINEAGE.json'
+    if lin.is_file():
+        L = json.loads(lin.read_text())
+        L['previous_build_id'] = L.get('build_id', base_id)
+        L['build_id'] = new.name
+        L.setdefault('lineage', []).append('%s: d3d9 rebuilt on %s (MTLD3D-PATCH.json)' % (new.name, base_id))
+        L.setdefault('rebuilds', []).append({
+            'build_id': new.name, 'base_build_id': base_id, 'tool': 'tools/runtime/patch-mtld3d-d3d9.py',
+            'change': info['change'], 'patches': names, 'reason': reason,
+            'patched_d3d9_aarch64_sha256': new_sha})
+        lin_new = new / 'BUILD-LINEAGE.json'
+        lin_new.write_text(json.dumps(L, indent=2, ensure_ascii=False) + '\n')
     print('patched %s\n  sha256 %s -> %s' % (dst, old_sha, new_sha))
 
 
