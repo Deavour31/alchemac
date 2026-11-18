@@ -8,6 +8,15 @@ final class LibraryModel: ObservableObject {
     @Published var registry: Registry
     @Published var importing = false
     @Published var importMessage = ""
+    /// An update is being downloaded, applied or verified: the library is locked like during an import.
+    @Published var updating = false
+    @Published var updateMessage = ""
+    /// Set right before the app quits for the update helper, so nothing holds the quit back.
+    var terminatingForUpdate = false
+    private var checkingForUpdate = false
+    @Published var automaticUpdateCheck: Bool = UserDefaults.standard.bool(forKey: Updater.automaticKey) {
+        didSet { UserDefaults.standard.set(automaticUpdateCheck, forKey: Updater.automaticKey) }
+    }
     /// Programs' own icons, filled in after extraction; the list shows a symbol until then.
     @Published var icons: [String: NSImage] = [:]
 
@@ -237,9 +246,109 @@ final class LibraryModel: ObservableObject {
         let store = self.store, runtime = AlchemacRuntime.root
         DispatchQueue.global(qos: .utility).async {
             let summary = StartupCleanup.run(store: store, runtime: runtime)
+            Updater.cleanup()
             DispatchQueue.main.async {
                 self.session.maintenance = false
                 if summary.freed > 500_000_000, !self.session.busy { self.session.message = "이전 실행 환경 사본 등 약 \(Self.size(summary.freed))를 정리했습니다." }
+            }
+        }
+    }
+
+    // MARK: Updates
+
+    private func alert(_ title: String, _ text: String, style: NSAlert.Style = .informational) {
+        let alert = NSAlert(); alert.alertStyle = style; alert.messageText = title; alert.informativeText = text; alert.runModal()
+    }
+
+    /// Automatic check, a short while after launch: silent unless a newer version is found.
+    func scheduleAutomaticUpdateCheck() {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            guard let self else { return }
+            let last = UserDefaults.standard.object(forKey: Updater.lastCheckKey) as? Date
+            guard Updater.shouldCheckAutomatically(enabled: self.automaticUpdateCheck, development: AlchemacRuntime.isDevelopment, last: last),
+                  !self.session.busy, !self.importing, !self.updating else { return }
+            self.checkForUpdate(manual: false)
+        }
+    }
+
+    func checkForUpdate(manual: Bool) {
+        guard !updating, !importing, !checkingForUpdate else { return }
+        checkingForUpdate = true
+        let build = AlchemacRuntime.appBuild
+        Task {
+            defer { self.checkingForUpdate = false }
+            do {
+                let found = try await Updater.checkForUpdate(currentBuild: build)
+                UserDefaults.standard.set(Date(), forKey: Updater.lastCheckKey)
+                if let found {
+                    if manual || !self.session.busy { self.offerUpdate(found) }
+                } else if manual {
+                    self.alert("최신 버전입니다", "현재 버전 v\(AlchemacRuntime.appVersion)이(가) 가장 새로운 버전입니다.")
+                }
+            } catch {
+                fputs("Alchemac: update check failed: \(error.localizedDescription)\n", stderr)
+                if manual { self.alert("업데이트를 확인하지 못했습니다", error.localizedDescription, style: .warning) }
+            }
+        }
+    }
+
+    private func offerUpdate(_ manifest: UpdateManifest) {
+        let build = AlchemacRuntime.appBuild
+        let size = manifest.delta(fromBuild: build)?.size ?? manifest.dmg.size
+        let alert = NSAlert(); alert.messageText = "새 버전 \(manifest.version)이(가) 있습니다"
+        alert.informativeText = "현재 버전: v\(AlchemacRuntime.appVersion)\n내려받을 크기: 약 \(Self.size(size))\n\n업데이트하면 앱이 다시 시작됩니다. 실행 중인 프로그램이 있으면 먼저 종료해 주세요."
+        alert.addButton(withTitle: "업데이트"); alert.addButton(withTitle: "나중에"); alert.addButton(withTitle: "변경 사항 보기")
+        while true {
+            let choice = alert.runModal()
+            if choice == .alertThirdButtonReturn {
+                if let url = URL(string: manifest.releaseURL) { NSWorkspace.shared.open(url) }
+                continue
+            }
+            if choice == .alertFirstButtonReturn { startUpdate(manifest) }
+            return
+        }
+    }
+
+    /// Never stops a session itself: with one running, the user is asked to quit programs first.
+    private func refuseWhileBusy() -> Bool {
+        if session.busy {
+            alert("실행 중인 프로그램이 있습니다", "업데이트하려면 실행 중인 프로그램을 먼저 모두 종료해 주세요.", style: .warning)
+            return true
+        }
+        if importing {
+            alert("다른 작업이 진행 중입니다", "작업이 끝난 뒤 다시 시도해 주세요.", style: .warning)
+            return true
+        }
+        return false
+    }
+
+    private func startUpdate(_ manifest: UpdateManifest) {
+        guard !updating, !refuseWhileBusy() else { return }
+        updating = true; updateMessage = "업데이트를 준비하는 중입니다…"
+        let app = Bundle.main.bundleURL, build = AlchemacRuntime.appBuild, oldVersion = AlchemacRuntime.appVersion
+        Task {
+            do {
+                let staging = try await Updater.prepare(manifest, app: app, currentBuild: build) { text, fraction in
+                    DispatchQueue.main.async { self.updateMessage = fraction.map { text + " (\(Int($0 * 100))%)" } ?? text }
+                }
+                // Sessions may have started while the download ran.
+                if self.refuseWhileBusy() { Updater.discard(staging); self.updating = false; return }
+                self.updateMessage = "업데이트를 설치하고 다시 시작합니다…"
+                do { try Updater.installAndRelaunch(staging: staging, app: app, oldVersion: oldVersion) }
+                catch { Updater.discard(staging); throw error }
+                self.terminatingForUpdate = true
+                NSApp.terminate(nil)
+            } catch UpdateError.cannotReplace {
+                self.updating = false
+                let alert = NSAlert(); alert.alertStyle = .warning
+                alert.messageText = "이 위치에서는 앱을 직접 교체할 수 없습니다"
+                alert.informativeText = "앱이 읽기 전용 위치(디스크 이미지 등)나 쓸 수 없는 폴더에 있거나 옮겨진 위치에서 실행 중입니다. 앱을 응용 프로그램 폴더로 옮긴 뒤 다시 시도하거나, 릴리스 페이지에서 새 버전을 내려받아 직접 설치해 주세요."
+                alert.addButton(withTitle: "릴리스 페이지 열기"); alert.addButton(withTitle: "닫기")
+                if alert.runModal() == .alertFirstButtonReturn, let url = URL(string: manifest.releaseURL) { NSWorkspace.shared.open(url) }
+            } catch {
+                self.updating = false
+                self.alert("업데이트하지 못했습니다", error.localizedDescription + "\n\n현재 앱은 그대로입니다.", style: .warning)
             }
         }
     }
@@ -305,7 +414,7 @@ final class LibraryModel: ObservableObject {
 
     func save() { do { try store.write(registry) } catch { self.error(error) } }
     func start() {
-        guard let selected else { return }
+        guard let selected, !updating else { return }
         // An add-on can ask for an English layout for programs that fail on a Korean one.
         let wantsEnglish = selected.addon.flatMap(store.addon)?.englishInput ?? false
         let switched = wantsEnglish ? EnglishInput.ensure() : nil
@@ -612,7 +721,7 @@ final class LibraryModel: ObservableObject {
 struct LibraryView: View {
     @ObservedObject var model: LibraryModel
     @ObservedObject var session: SessionController
-    private var locked: Bool { model.importing }
+    private var locked: Bool { model.importing || model.updating }
     private var selectedRunning: Bool { model.selected.map { session.isRunning($0.id) } ?? false }
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -686,6 +795,9 @@ struct LibraryView: View {
                     Button("이 실행의 로그 열기", action: model.revealProblemLog).disabled(session.lastProblemLogs.isEmpty)
                     Button("진단 로그 열기", action: model.revealLogs)
                     Button("오픈소스 라이선스") { NSWorkspace.shared.open(AlchemacRuntime.licenses) }
+                    Divider()
+                    Button("업데이트 확인…") { model.checkForUpdate(manual: true) }.disabled(locked)
+                    Toggle("업데이트 자동 확인", isOn: $model.automaticUpdateCheck)
                 }.fixedSize()
                 Menu("애드온") {
                     ForEach(model.addons) { addon in
@@ -724,7 +836,7 @@ struct LibraryView: View {
                     Button("세션 종료", action: model.stop).disabled(running.stopping)
                 } else {
                     Button(action: model.start) { Label("선택한 프로그램 실행", systemImage: "play.fill") }
-                        .buttonStyle(.borderedProminent).tint(.teal).disabled(model.selected == nil || model.importing)
+                        .buttonStyle(.borderedProminent).tint(.teal).disabled(model.selected == nil || locked)
                 }
             }
             Divider()
@@ -735,9 +847,9 @@ struct LibraryView: View {
                         Text("동시에 실행 중 \(session.sessions.count)개: " + session.sessions.values.map(\.title).sorted().joined(separator: ", "))
                             .font(.caption.weight(.medium))
                     }
-                    Text(model.importing ? model.importMessage : session.message).font(.callout).foregroundStyle(.secondary)
+                    Text(model.importing ? model.importMessage : model.updating ? model.updateMessage : session.message).font(.callout).foregroundStyle(.secondary)
                         .textSelection(.enabled)
-                    if !model.importing, !session.busy, !session.lastProblemLogs.isEmpty {
+                    if !locked, !session.busy, !session.lastProblemLogs.isEmpty {
                         Button("이 실행의 로그 열기", action: model.revealProblemLog).font(.caption)
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading)
@@ -759,6 +871,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         do {
+            Updater.registerDefaults()
             let model = try LibraryModel(store: LauncherStore()); self.model = model
             model.session.finished = { [weak self] in
                 guard let self, self.waitingToQuit else { return }
@@ -775,6 +888,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             model.showRecoveryNotice()
             model.checkOrphans(startup: true)
             model.startCleanup()
+            model.scheduleAutomaticUpdateCheck()
         } catch {
             let alert = NSAlert(); alert.messageText = "보관함을 열 수 없습니다"; alert.informativeText = error.localizedDescription
             alert.runModal(); NSApp.terminate(nil)
@@ -786,6 +900,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowShouldClose(_ sender: NSWindow) -> Bool { NSApp.terminate(nil); return false }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let model else { return .terminateNow }
+        if model.terminatingForUpdate { return .terminateNow }
+        if model.updating {
+            let alert = NSAlert(); alert.messageText = "업데이트를 준비하는 중입니다"; alert.informativeText = "내려받기와 검증이 끝난 뒤 앱을 종료해 주세요."; alert.runModal()
+            return .terminateCancel
+        }
         if model.importing {
             let alert = NSAlert(); alert.messageText = "가져오기가 진행 중입니다"; alert.informativeText = "복사가 끝난 뒤 앱을 종료해 주세요."; alert.runModal()
             return .terminateCancel

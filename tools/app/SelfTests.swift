@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Darwin
 
 @main
@@ -831,6 +832,193 @@ struct SelfTests {
             let kept = Backups.protected(env)
             try check(Set(Backups.removable(found, protected: kept).map(\.lastPathComponent)) == ["lab.backup.20260101-000000.7", "lab.backup.odd"], "the snapshot an unfinished migration points to is never removable")
             try check(Backups.removable([], protected: nil).isEmpty && Backups.removable(Array(found.prefix(1)), protected: nil).isEmpty, "a single snapshot is kept")
+        }
+
+        // Updates: signed manifest, tree verification, delta application and the install helper (no network).
+        do {
+            let signing = Curve25519.Signing.PrivateKey()
+            let publicKey = signing.publicKey.rawRepresentation.base64EncodedString()
+            func file(_ url: URL, _ text: String, executable: Bool = false) throws {
+                try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data(text.utf8).write(to: url)
+                try fm.setAttributes([.posixPermissions: executable ? 0o755 : 0o644], ofItemAtPath: url.path)
+            }
+            /// A fake app: Info.plist, an executable, a file with spaces/Korean in its path, a link, an empty folder.
+            func fakeApp(_ root: URL, version: String, build: Int, binary: String, extra: [String: String] = [:]) throws {
+                try fm.createDirectory(at: root.appendingPathComponent("Contents/Resources/빈 폴더"), withIntermediateDirectories: true)
+                let plist: [String: Any] = ["CFBundleIdentifier": "io.github.deavour31.alchemac", "CFBundleVersion": String(build), "CFBundleShortVersionString": version]
+                try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0).write(to: root.appendingPathComponent("Contents/Info.plist"))
+                try file(root.appendingPathComponent("Contents/MacOS/Alchemac"), binary, executable: true)
+                try file(root.appendingPathComponent("Contents/Resources/한글 dir/a b.txt"), "same")
+                try fm.createSymbolicLink(atPath: root.appendingPathComponent("Contents/Resources/link").path, withDestinationPath: "한글 dir/a b.txt")
+                for (path, text) in extra { try file(root.appendingPathComponent(path), text) }
+            }
+            func entries(_ app: URL) throws -> [UpdateManifest.Entry] {
+                let found = try { () throws -> [String: RuntimeCopy.Entry] in
+                    guard let f = RuntimeCopy.scan(app.path) else { throw AlchemacError.message("scan") }; return f }()
+                return try found.keys.sorted().map { path in
+                    let entry = found[path]!, url = app.appendingPathComponent(path)
+                    switch entry.kind {
+                    case UInt16(S_IFDIR): return .init(path: path, type: "dir")
+                    case UInt16(S_IFLNK): return .init(path: path, type: "link", target: entry.link)
+                    default:
+                        var info = stat(); _ = lstat(url.path, &info)
+                        return .init(path: path, type: "file", size: entry.size, sha256: try Updater.sha256Hex(of: url), executable: info.st_mode & 0o111 != 0)
+                    }
+                }
+            }
+            func manifestOf(_ app: URL, version: String = "0.5.13", build: Int = 36, entries given: [UpdateManifest.Entry]? = nil,
+                            dmg: String = "Alchemac-0.5.13.dmg", delta: String = "Alchemac-0.5.13-from-35.tar.xz", schema: Int = 1) throws -> UpdateManifest {
+                let sha = String(repeating: "ab", count: 32)
+                return UpdateManifest(schema: schema, bundleID: "io.github.deavour31.alchemac", version: version, build: build, minimumSystem: "27.0",
+                                      releaseURL: "https://github.com/Deavour31/alchemac/releases/tag/v" + version,
+                                      dmg: .init(name: dmg, size: 10, sha256: sha), deltas: [.init(fromBuild: 35, name: delta, size: 5, sha256: sha)],
+                                      entries: try given ?? entries(app))
+            }
+            func encode(_ manifest: UpdateManifest) throws -> Data { let e = JSONEncoder(); e.outputFormatting = [.sortedKeys]; return try e.encode(manifest) }
+            func sign(_ data: Data, _ key: Curve25519.Signing.PrivateKey = signing) throws -> Data { Data(try key.signature(for: data).base64EncodedString().utf8) }
+
+            let newApp = temp.appendingPathComponent("update new 새 앱.app"), oldApp = temp.appendingPathComponent("update old.app")
+            try fakeApp(newApp, version: "0.5.13", build: 36, binary: "binary v36", extra: ["Contents/Resources/new.txt": "added"])
+            try fakeApp(oldApp, version: "0.5.12", build: 35, binary: "binary v35", extra: ["Contents/Resources/gone.txt": "only in the old app"])
+            let manifest = try manifestOf(newApp)
+            let data = try encode(manifest)
+
+            // Signature and validation.
+            let ok = try Updater.verifiedManifest(data: data, signature: sign(data), publicKey: publicKey)
+            try check(ok == manifest && ok.build == 36, "a manifest with a valid signature is accepted")
+            var tampered = data; tampered[tampered.firstIndex(of: UInt8(ascii: "3"))!] = UInt8(ascii: "4")
+            try rejects("a tampered manifest byte is rejected") { _ = try Updater.verifiedManifest(data: tampered, signature: sign(data), publicKey: publicKey) }
+            try rejects("a signature by another key is rejected") { _ = try Updater.verifiedManifest(data: data, signature: sign(data, Curve25519.Signing.PrivateKey()), publicKey: publicKey) }
+            try rejects("the placeholder public key rejects everything") { _ = try Updater.verifiedManifest(data: data, signature: sign(data), publicKey: UpdateFeed.publicKey) }
+            try rejects("garbage instead of a signature is rejected") { _ = try Updater.verifiedManifest(data: data, signature: Data("not base64!".utf8), publicKey: publicKey) }
+            func signed(_ m: UpdateManifest) throws -> Void { let d = try encode(m); _ = try Updater.verifiedManifest(data: d, signature: sign(d), publicKey: publicKey) }
+            let good = manifest.entries
+            for bad in ["../x", "/abs", "a/../../b", "", "a//b", "./a", "a/."] {
+                try rejects("unsafe path \"\(bad)\" is rejected even when signed") { try signed(manifestOf(newApp, entries: good + [.init(path: bad, type: "dir")])) }
+            }
+            try rejects("a duplicate path is rejected") { try signed(manifestOf(newApp, entries: good + [good[0]])) }
+            try rejects("a link that escapes the bundle is rejected") { try signed(manifestOf(newApp, entries: good + [.init(path: "Contents/bad", type: "link", target: "../../x")])) }
+            try rejects("an absolute link target is rejected") { try signed(manifestOf(newApp, entries: good + [.init(path: "Contents/bad", type: "link", target: "/usr/bin")])) }
+            try signed(manifestOf(newApp, entries: good + [.init(path: "Contents/a/ok", type: "link", target: "../b/c")]))
+            try check(true, "a link that stays inside the bundle is accepted")
+            try rejects("a delta name with a slash is rejected") { try signed(manifestOf(newApp, delta: "../evil.tar.xz")) }
+            try rejects("a dmg name with a slash is rejected") { try signed(manifestOf(newApp, dmg: "dir/Alchemac.dmg")) }
+            try rejects("another schema is rejected") { try signed(manifestOf(newApp, schema: 2)) }
+            try rejects("a malformed sha256 is rejected") { try signed(manifestOf(newApp, entries: good + [.init(path: "Contents/z", type: "file", size: 1, sha256: "ABC", executable: false)])) }
+            try rejects("a negative size is rejected") { try signed(manifestOf(newApp, entries: good + [.init(path: "Contents/z", type: "file", size: -1, sha256: String(repeating: "0", count: 64), executable: false)])) }
+            try rejects("a version that is not numeric is rejected") { try signed(manifestOf(newApp, version: "1.0/../x")) }
+            try check(!Updater.isNewer(build: 35, than: 36) && !Updater.isNewer(build: 36, than: 36) && Updater.isNewer(build: 37, than: 36), "only a strictly higher build is an update")
+            try check(Updater.systemMeets("27.0", current: OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0))
+                      && !Updater.systemMeets("27.1", current: OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 5))
+                      && Updater.systemMeets("26.4", current: OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0)), "the minimum system version is compared numerically")
+            let now = Date()
+            try check(Updater.shouldCheckAutomatically(enabled: true, development: false, last: nil, now: now)
+                      && Updater.shouldCheckAutomatically(enabled: true, development: false, last: now.addingTimeInterval(-25 * 3600), now: now)
+                      && !Updater.shouldCheckAutomatically(enabled: true, development: false, last: now.addingTimeInterval(-23 * 3600), now: now)
+                      && !Updater.shouldCheckAutomatically(enabled: false, development: false, last: nil, now: now)
+                      && !Updater.shouldCheckAutomatically(enabled: true, development: true, last: nil, now: now), "the automatic check runs once a day, only when enabled and not in development")
+            let suite = UserDefaults(suiteName: "alchemac-selftest-" + UUID().uuidString)!
+            suite.set("file:///tmp/feed", forKey: "UpdateFeedURL")
+            try check(UpdateFeed.feedBase(development: false, defaults: suite) == UpdateFeed.base
+                      && UpdateFeed.feedBase(development: true, defaults: suite).absoluteString == "file:///tmp/feed/"
+                      && UpdateFeed.assetURL(version: "0.5.13", name: "a.dmg", development: true, defaults: suite).absoluteString == "file:///tmp/feed/a.dmg"
+                      && UpdateFeed.assetURL(version: "0.5.13", name: "a.dmg", development: false, defaults: suite).absoluteString == "https://github.com/Deavour31/alchemac/releases/download/v0.5.13/a.dmg", "the feed override applies to development builds only")
+            suite.set("ftp://example.com/", forKey: "UpdateFeedURL")
+            try check(UpdateFeed.feedOverride(development: true, defaults: suite) == nil, "a feed override must be http, https or file")
+
+            // Tree verification.
+            try Updater.verifyTree(app: newApp, manifest: manifest)
+            try check(true, "an exact tree passes verification")
+            func mutated(_ label: String, _ change: (URL) throws -> Void) throws {
+                let copy = temp.appendingPathComponent("mut-" + UUID().uuidString + ".app")
+                try fm.copyItem(at: newApp, to: copy)
+                defer { try? fm.removeItem(at: copy) }
+                try change(copy)
+                try rejects(label) { try Updater.verifyTree(app: copy, manifest: manifest) }
+            }
+            try mutated("an extra file fails verification") { try file($0.appendingPathComponent("Contents/extra"), "x") }
+            try mutated("an extra folder fails verification") { try fm.createDirectory(at: $0.appendingPathComponent("Contents/extra-dir"), withIntermediateDirectories: false) }
+            try mutated("a missing file fails verification") { try fm.removeItem(at: $0.appendingPathComponent("Contents/Resources/new.txt")) }
+            try mutated("a changed byte fails verification") { try file($0.appendingPathComponent("Contents/Resources/new.txt"), "addeD") }
+            try mutated("a wrong executable bit fails verification") { try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: $0.appendingPathComponent("Contents/MacOS/Alchemac").path) }
+            try mutated("a changed link target fails verification") {
+                let link = $0.appendingPathComponent("Contents/Resources/link")
+                try fm.removeItem(at: link); try fm.createSymbolicLink(atPath: link.path, withDestinationPath: "gone.txt")
+            }
+            try mutated("a file replaced by a link fails verification") {
+                let url = $0.appendingPathComponent("Contents/Resources/new.txt")
+                try fm.removeItem(at: url); try fm.createSymbolicLink(atPath: url.path, withDestinationPath: "gone.txt")
+            }
+            try Updater.verifyIdentity(app: newApp, manifest: manifest, codesign: false)
+            try check(true, "Info.plist identity matches the manifest")
+            try rejects("another build number fails the identity check") { try Updater.verifyIdentity(app: oldApp, manifest: manifest, codesign: false) }
+            try rejects("an unsigned fake app fails the codesign check") { try Updater.verifyIdentity(app: newApp, manifest: manifest) }
+
+            // Delta, made the way scripts/make-update-feed.py makes it, applied to a clone of the old app.
+            let oldEntries = Dictionary(uniqueKeysWithValues: try entries(oldApp).map { ($0.path, $0) })
+            let changed = manifest.entries.filter { $0.type != "dir" && oldEntries[$0.path] != $0 }.map(\.path)
+            try check(Set(changed) == ["Contents/Info.plist", "Contents/MacOS/Alchemac", "Contents/Resources/new.txt"], "the delta holds exactly the changed and added files")
+            let archive = temp.appendingPathComponent("delta test.tar.xz"), listing = temp.appendingPathComponent("delta.list")
+            try Data(changed.sorted().map { $0 + "\n" }.joined().utf8).write(to: listing)
+            let made = try Updater.run("/usr/bin/tar", ["--no-mac-metadata", "--no-xattrs", "-cJf", archive.path, "-C", newApp.path, "-T", listing.path])
+            try check(made.status == 0, "the delta archive is created with tar")
+            let staged = temp.appendingPathComponent("staged.app")
+            try fm.copyItem(at: oldApp, to: staged)
+            try check(fm.fileExists(atPath: staged.appendingPathComponent("Contents/Resources/gone.txt").path), "the clone starts with a file only the old app has")
+            try Updater.applyDelta(archive: archive, to: staged, manifest: manifest)
+            try Updater.verifyTree(app: staged, manifest: manifest)
+            try check(true, "the old app plus the delta passes the new manifest")
+            try check(!fm.fileExists(atPath: staged.appendingPathComponent("Contents/Resources/gone.txt").path)
+                      && fm.fileExists(atPath: staged.appendingPathComponent("Contents/Resources/빈 폴더").path), "a file only in the old app is removed and an unchanged folder stays")
+            // The same pruning removes a whole folder that is no longer listed, deepest first.
+            try file(staged.appendingPathComponent("Contents/old-dir/sub/file"), "x")
+            try Updater.conform(app: staged, to: manifest)
+            try check(!fm.fileExists(atPath: staged.appendingPathComponent("Contents/old-dir").path), "an unlisted folder with contents is removed")
+            let wrongExec = temp.appendingPathComponent("wrong-exec.app")
+            try fm.copyItem(at: newApp, to: wrongExec)
+            try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: wrongExec.appendingPathComponent("Contents/MacOS/Alchemac").path)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: wrongExec.appendingPathComponent("Contents/Resources/new.txt").path)
+            try Updater.conform(app: wrongExec, to: manifest)
+            try Updater.verifyTree(app: wrongExec, manifest: manifest)
+            try check(true, "executable bits are fixed to the manifest")
+            try rejects("a delta that does not match the manifest fails verification") {
+                let broken = temp.appendingPathComponent("broken.app")
+                try fm.copyItem(at: oldApp, to: broken)      // not applied: still the old tree
+                try Updater.verifyTree(app: broken, manifest: manifest)
+            }
+
+            // Where the app may replace itself.
+            try check(!Updater.canReplace(app: URL(fileURLWithPath: "/private/var/folders/x/AppTranslocation/ABC/d/Alchemac.app"), updates: temp), "a translocated app cannot replace itself")
+            try check(Updater.canReplace(app: temp.appendingPathComponent("Alchemac.app"), updates: temp.appendingPathComponent("updates")), "an app in a writable folder on the updates volume can")
+            try check(!Updater.canReplace(app: URL(fileURLWithPath: "/System/Applications/Alchemac.app"), updates: temp), "an app in a read-only location cannot")
+            try check(Updater.stagingURL(app: URL(fileURLWithPath: "/Applications/Alchemac.app"), build: 36).path == "/Applications/.Alchemac-update-36.app", "staging sits next to the app")
+
+            // Install helper (a pid that has already exited, no `open`), paths with spaces.
+            let updates = temp.appendingPathComponent("up dates")
+            let installed = temp.appendingPathComponent("Installed 앱/Alchemac.app"), stage = temp.appendingPathComponent("Installed 앱/.Alchemac-update-36.app")
+            try file(installed.appendingPathComponent("Contents/marker"), "old")
+            try file(stage.appendingPathComponent("Contents/marker"), "new")
+            let gone = Process(); gone.executableURL = URL(fileURLWithPath: "/usr/bin/true"); try gone.run(); gone.waitUntilExit()
+            try Updater.installAndRelaunch(staging: stage, app: installed, oldVersion: "0.5.12", updates: updates, waitFor: gone.processIdentifier, open: false, wait: true)
+            let backup = updates.appendingPathComponent("previous/Alchemac-0.5.12.app")
+            try check((try? String(contentsOf: installed.appendingPathComponent("Contents/marker"), encoding: .utf8)) == "new"
+                      && (try? String(contentsOf: backup.appendingPathComponent("Contents/marker"), encoding: .utf8)) == "old"
+                      && !fm.fileExists(atPath: stage.path), "the helper swaps the apps and keeps the old one as a backup")
+            try check(Updater.backupURL(oldVersion: "0.5.12", updates: updates).lastPathComponent == "Alchemac-0.5.12-2.app", "an existing backup name gets a numeric suffix")
+            try check((try? String(contentsOf: updates.appendingPathComponent("install-helper.sh"), encoding: .utf8))?.contains(installed.path) == false, "paths are arguments, never part of the helper script")
+            // A missing staging folder changes nothing.
+            try rejects("the helper leaves the app alone when the staging folder is missing") {
+                try Updater.installAndRelaunch(staging: stage, app: installed, oldVersion: "0.5.13", updates: updates, waitFor: gone.processIdentifier, open: false, wait: true)
+            }
+            try check((try? String(contentsOf: installed.appendingPathComponent("Contents/marker"), encoding: .utf8)) == "new", "the app is unchanged after a refused swap")
+
+            // Launch cleanup: finished download folders and stale staging go; the Trash is not touched (no previous apps here).
+            let cleanUpdates = temp.appendingPathComponent("clean-updates"), cleanParent = temp.appendingPathComponent("clean-parent")
+            for name in ["34", "35", "36", "37", "notes"] { try file(cleanUpdates.appendingPathComponent(name + "/part"), "x") }
+            try file(cleanParent.appendingPathComponent(".Alchemac-update-35.app/Contents/x"), "x"); try file(cleanParent.appendingPathComponent("Other.app/Contents/x"), "x")
+            Updater.cleanup(app: cleanParent.appendingPathComponent("Alchemac.app"), currentBuild: 36, updates: cleanUpdates)
+            try check(StartupCleanup.names(cleanUpdates) == ["37", "notes"] && StartupCleanup.names(cleanParent) == ["Other.app"], "launch cleanup removes download folders up to the current build and stale staging")
         }
         print("RESULT: \(passed) checks passed")
     }

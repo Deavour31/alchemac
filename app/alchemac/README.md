@@ -115,6 +115,18 @@ supervisor holds the environment's session lock; see `OrphanSessions` in `Mainte
 staging folders and old private runtime copies in the background (`StartupCleanup`), and "Wine 환경 > 환경 백업 정리…"
 keeps only the newest migration snapshot of each environment (`Backups`).
 
+## Updates
+
+Alchemac checks GitHub for a newer release about once a day (the request is visible to GitHub) and offers it in a
+dialog; **관리 ▸ 업데이트 확인…** checks on demand and **업데이트 자동 확인** turns the daily check off. When the
+installed build is covered by a delta, only the changed files are downloaded (usually a few MB instead of the whole
+~1.2 GB disk image). Every update is verified before it replaces the app: the release's `update.json` must carry a
+valid Ed25519 signature from the release signing key, and each file of the prepared copy must match the signed
+manifest's SHA-256, followed by `codesign --verify`. The old app is kept in the Trash until the next launch. Updates
+are never applied while programs are running, and an app that cannot replace itself where it is (for example opened
+from the disk image) is pointed to the release page instead. `scripts/make-update-feed.py` builds the feed and
+`tools/app/update-sign.swift` is the signing tool.
+
 ## License
 
 Alchemac's own code is MIT licensed (`LICENSE`). The app bundles the Hadron

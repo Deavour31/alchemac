@@ -24,16 +24,18 @@ FILES = {
     'config/alchemac.json': 'config/alchemac.json',
     'scripts/build-alchemac-app.py': 'scripts/build-alchemac-app.py',
     'scripts/export-alchemac-repo.py': 'scripts/export-alchemac-repo.py',
+    'scripts/make-update-feed.py': 'scripts/make-update-feed.py',
     'tools/app/make-icon.swift': 'tools/app/make-icon.swift',
     'tools/app/SelfTests.swift': 'tools/app/SelfTests.swift',
     'tools/app/request-close.swift': 'tools/app/request-close.swift',
+    'tools/app/update-sign.swift': 'tools/app/update-sign.swift',
     'tools/runtime/patch-locale-nls.py': 'tools/runtime/patch-locale-nls.py',
     'tools/runtime/build-mtld3d-d3d9.sh': 'tools/runtime/build-mtld3d-d3d9.sh',
     'tools/runtime/patch-mtld3d-d3d9.py': 'tools/runtime/patch-mtld3d-d3d9.py',
     'tools/runtime/patch-wine-unix-lib.py': 'tools/runtime/patch-wine-unix-lib.py',
 }
 APP_SOURCES = ['main.swift', 'App.swift', 'Runtime.swift', 'SessionController.swift', 'Profile.swift',
-               'InputSource.swift', 'Addon.swift', 'ExeIcon.swift', 'Maintenance.swift', 'prefix-profile.c', 'session-attach', 'README.md', 'LICENSE']
+               'InputSource.swift', 'Addon.swift', 'ExeIcon.swift', 'Maintenance.swift', 'Updater.swift', 'prefix-profile.c', 'session-attach', 'README.md', 'LICENSE']
 
 HADRON_README = f"""# Hadron changes
 
