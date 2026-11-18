@@ -25,7 +25,7 @@ if _longest_root > 180:
                      % (PROFILE['runtime_build_id'], _longest_root))
 RELEASE = '--release' in sys.argv[1:]
 BUNDLE_ID = 'io.github.deavour31.alchemac'
-VERSION, BUILD = '0.5.14', '37'
+VERSION, BUILD = '0.5.15', '38'
 # https://dl.winehq.org/wine/wine-mono/11.3.0/wine-mono-11.3.0-x86.msi, the version this Wine asks for.
 WINE_MONO_SHA256 = 'df2dfc1665c2511882e7cabd56eafd0c0a3d94e5a7e86f969277f6c189d418d3'
 PARENT = ROOT / ('outputs/alchemac-release.noindex' if RELEASE else 'outputs/alchemac-app-build.noindex')
@@ -62,7 +62,7 @@ def main():
     shutil.rmtree(contents / 'SharedSupport/runtime/steam')
     for script in (contents / 'SharedSupport/runtime/scripts').glob('steam-*'):
         script.unlink()
-    sources = [ROOT / 'app/alchemac' / n for n in ('main.swift', 'App.swift', 'Runtime.swift', 'SessionController.swift', 'Profile.swift', 'InputSource.swift', 'Addon.swift', 'ExeIcon.swift', 'Maintenance.swift', 'Updater.swift')]
+    sources = [ROOT / 'app/alchemac' / n for n in ('main.swift', 'App.swift', 'Runtime.swift', 'SessionController.swift', 'ProgramState.swift', 'Profile.swift', 'InputSource.swift', 'Addon.swift', 'ExeIcon.swift', 'Maintenance.swift', 'Updater.swift')]
     run(['/usr/bin/xcrun', 'swiftc', '-O', '-swift-version', '5', '-target', 'arm64-apple-macos27.0', '-module-cache-path', CACHE,
          '-o', contents / 'MacOS/Alchemac', *sources])
     fonts = resources / 'Fonts'

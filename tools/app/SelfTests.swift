@@ -1056,6 +1056,37 @@ struct SelfTests {
             try file(updates.appendingPathComponent("last-install.txt"), "target=abc\noutcome=installed\n")
             try check(Updater.takeInstallResult(updates: updates) == nil, "a malformed result is ignored and removed")
 
+            // The helper's failure paths. The script text is run as is, with only `/bin/mv` swapped for a stub that fails on request
+            // (a real mv failure would need a permission trick between the helper's two moves).
+            let mvStub = temp.appendingPathComponent("mv-stub")
+            try file(mvStub, "#!/bin/sh\nfor a; do last=\"$a\"; done\nfirst=\"\"; for a; do case \"$a\" in -*) ;; *) first=\"$a\"; break;; esac; done\n"
+                     + "[ -n \"$FAIL_SRC\" ] && [ \"$first\" = \"$FAIL_SRC\" ] && exit 1\n[ -n \"$FAIL_DEST\" ] && [ \"$last\" = \"$FAIL_DEST\" ] && exit 1\nexec /bin/mv \"$@\"\n")
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: mvStub.path)
+            let stubbed = Updater.helperScript.replacingOccurrences(of: "/bin/mv", with: mvStub.path)
+            try check(stubbed != Updater.helperScript && !stubbed.contains("/bin/mv"), "the test script swaps every mv")
+            func swapScenario(_ name: String, failSource: Bool, failDestination: Bool) throws -> (app: URL, stage: URL, backup: URL, result: (target: Int, outcome: String)?) {
+                let base = temp.appendingPathComponent("swap-" + name)
+                let app = base.appendingPathComponent("Alchemac.app"), stage = base.appendingPathComponent(".Alchemac-update-40.app"), ups = base.appendingPathComponent("updates")
+                try file(app.appendingPathComponent("Contents/marker"), "old"); try file(stage.appendingPathComponent("Contents/marker"), "new")
+                if failSource { setenv("FAIL_SRC", stage.path, 1) }
+                if failDestination { setenv("FAIL_DEST", app.path, 1) }
+                defer { unsetenv("FAIL_SRC"); unsetenv("FAIL_DEST") }
+                try? Updater.installAndRelaunch(staging: stage, app: app, oldVersion: "1.0", targetBuild: 40, updates: ups, waitFor: gone.processIdentifier, open: false, wait: true, script: stubbed)
+                return (app, stage, ups.appendingPathComponent("previous/Alchemac-1.0.app"), Updater.takeInstallResult(updates: ups))
+            }
+            let restored = try swapScenario("restored", failSource: true, failDestination: false)
+            try check(restored.result?.outcome == "restored" && restored.result?.target == 40, "a failed swap-in with a successful move back is recorded as restored")
+            try check((try? String(contentsOf: restored.app.appendingPathComponent("Contents/marker"), encoding: .utf8)) == "old"
+                      && !fm.fileExists(atPath: restored.backup.path) && fm.fileExists(atPath: restored.stage.path), "restored: the old app is back in place and the staging copy is left")
+            let lost = try swapScenario("lost", failSource: false, failDestination: true)
+            try check(lost.result?.outcome == "restore-failed" && lost.result?.target == 40, "a failed swap-in with a failed move back is recorded as restore-failed")
+            try check(!fm.fileExists(atPath: lost.app.path) && (try? String(contentsOf: lost.backup.appendingPathComponent("Contents/marker"), encoding: .utf8)) == "old",
+                      "restore-failed: the old app is still at the backup path, nothing is at the app path")
+            try check(Updater.installReport((40, "restore-failed"), runningBuild: 36) == .failed(outcome: "restore-failed"), "a restore-failed result is reported as a failure")
+            // After a failed restore the startup cleanup must leave the previous apps alone.
+            Updater.cleanup(app: lost.app, currentBuild: 36, updates: lost.backup.deletingLastPathComponent().deletingLastPathComponent(), trashPrevious: false)
+            try check(fm.fileExists(atPath: lost.backup.path), "cleanup with trashPrevious false keeps the previous app")
+
             // Check results: up to date, available, or newer but needing a newer macOS.
             let sys27 = OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0)
             let newer = manifest
@@ -1072,6 +1103,85 @@ struct SelfTests {
             try file(cleanParent.appendingPathComponent(".Alchemac-update-35.app/Contents/x"), "x"); try file(cleanParent.appendingPathComponent("Other.app/Contents/x"), "x")
             Updater.cleanup(app: cleanParent.appendingPathComponent("Alchemac.app"), currentBuild: 36, updates: cleanUpdates)
             try check(StartupCleanup.names(cleanUpdates) == ["37", "notes"] && StartupCleanup.names(cleanParent) == ["Other.app"], "launch cleanup removes download folders up to the current build and stale staging")
+        }
+
+        // Program availability, row status, results inbox and quit summary (pure rules behind the window).
+        do {
+            let shared = "/lib/prefixes/shared", other = "/lib/prefixes/env", own = "/lib/launchers/x/prefix"
+            func snap(_ prefix: String, _ id: String?, _ title: String, stopping: Bool = false, preparing: Bool = false) -> SessionSnapshot {
+                SessionSnapshot(prefix: prefix, launcherID: id, title: title, stopping: stopping, preparing: preparing)
+            }
+            func make(_ id: String, _ prefix: String?, _ sessions: [SessionSnapshot] = [], task: String? = nil, updating: Bool = false, maintenance: Bool = false) -> ProgramAvailability {
+                ProgramAvailability.make(launcherID: id, prefix: prefix, sessions: sessions, task: task, updating: updating, maintenance: maintenance)
+            }
+            let idle = make("a", shared)
+            try check(idle.canRun && idle.canRename && idle.canRemove && idle.canDelete && idle.canToggleRetina && idle.canToggleScaled && idle.canRunTool && !idle.canStopEnvironment && idle.runReason == nil,
+                      "an idle program can do everything except stop")
+            let blocked = make("b", shared, [snap(shared, "a", "사진 뷰어")])
+            try check(!blocked.canRun && blocked.runReason == "같은 Wine 환경에서 ‘사진 뷰어’ 실행 중", "run is blocked by a session in the same Wine environment, with the reason")
+            try check(blocked.canStopEnvironment && blocked.environmentSession == "사진 뷰어" && !blocked.ownSession, "the environment can be stopped from another program's row")
+            try check(!blocked.canToggleRetina && blocked.retinaReason == ProgramAvailability.retinaBusyReason && ProgramAvailability.retinaBusyReason == "이 환경의 프로그램이 모두 끝나면 바꿀 수 있습니다",
+                      "Retina is blocked while the environment is in use")
+            try check(blocked.canRename && blocked.canRemove && !blocked.canDelete && blocked.deleteReason?.contains("사진 뷰어") == true, "another program's session blocks delete but not rename or remove")
+            try check(blocked.canRunTool && blocked.canToggleScaled, "a tool can join a running environment and the per-program scale stays available")
+            try check(make("b", other, [snap(shared, "a", "사진 뷰어")]).canRun, "a session in another Wine environment does not block")
+            let running = make("a", shared, [snap(shared, "a", "사진 뷰어")])
+            try check(!running.canRun && running.runReason == "이미 실행 중입니다" && running.ownSession && !running.canRename && !running.canRemove && !running.canDelete,
+                      "a running program cannot be renamed, removed or deleted")
+            try check(!make("a", shared, [snap(shared, "a", "사진 뷰어", stopping: true)]).canStopEnvironment
+                      && !make("a", shared, [snap(shared, "a", "사진 뷰어", stopping: true)]).canRunTool, "a stopping environment is not stopped again and takes no tool")
+            try check(!make("a", own, [snap(own, nil, "설치.exe")]).canRun && make("a", own, [snap(shared, nil, "설치.exe")]).canRun, "an installer without a row blocks only its own environment")
+            for (label, state) in [("a task", make("a", shared, task: "프로그램 삭제")), ("an update", make("a", shared, updating: true))] {
+                try check(!state.canRun && !state.canRename && !state.canRemove && !state.canDelete && !state.canToggleRetina && !state.canToggleScaled && !state.canRunTool, "\(label) locks the program")
+            }
+            try check(make("a", shared, task: "프로그램 삭제").runReason?.contains("프로그램 삭제") == true, "the busy task is named in the reason")
+            let cleaning = make("a", shared, maintenance: true)
+            try check(!cleaning.canRun && cleaning.canRename && !cleaning.canRunTool, "the startup cleanup stops runs (and a tool that would start a session) only")
+            try check(make("a", shared, [snap(shared, "z", "x")], maintenance: true).canRunTool, "joining a running session is fine during the cleanup")
+            try check(!make("a", nil).canRun && !make("a", nil).canToggleRetina && !make("a", nil).canRunTool, "a program whose environment cannot be found cannot run")
+
+            // Row status: one badge, or who holds the shared environment.
+            try check(RowStatus.make(launcherID: "a", prefix: shared, sessions: [], failed: false) == RowStatus(badge: nil, sharedWith: nil), "an idle row shows nothing")
+            try check(RowStatus.make(launcherID: "a", prefix: shared, sessions: [snap(shared, "a", "A")], failed: true).badge == .running, "the program that started the session shows 실행 중 (not the old error)")
+            try check(RowStatus.make(launcherID: "a", prefix: shared, sessions: [snap(shared, "a", "A", preparing: true)], failed: false).badge == .preparing
+                      && RowStatus.make(launcherID: "a", prefix: shared, sessions: [snap(shared, "a", "A", stopping: true, preparing: true)], failed: false).badge == .stopping, "준비 중 and 종료 중 (stopping wins)")
+            let sharing = RowStatus.make(launcherID: "b", prefix: shared, sessions: [snap(shared, "a", "A")], failed: true)
+            try check(sharing.badge == nil && sharing.sharedWith == "A" && RowStatus.sharedText("A") == "같은 Wine 환경에서 ‘A’ 실행 중", "a row sharing the environment shows the secondary line, no badge")
+            try check(RowStatus.make(launcherID: "b", prefix: shared, sessions: [snap(other, "a", "A")], failed: true).badge == .failed, "a failed row shows 실행 오류")
+            try check(RowStatus.badgeText(.failed) == "실행 오류" && !RowStatus.help(.running, time: nil).isEmpty && RowStatus.help(.failed, time: "11:18").contains("11:18"), "plain badge text, precise help text")
+            try check(UnregisteredSessions.filter([snap(shared, "a", "A"), snap(other, nil, "설치.exe"), snap(own, "gone", "도구.exe")], registered: ["a"]).map(\.title) == ["도구.exe", "설치.exe"],
+                      "sessions without a row (no ID, or an unknown ID) are listed on their own")
+
+            // Results inbox.
+            var results: [ResultItem] = []
+            let manifest = try JSONDecoder().decode(UpdateManifest.self, from: Data(#"{"schema":1,"bundleID":"x","version":"9.9.9","build":99,"minimumSystem":"27.0","releaseURL":"https://example.invalid/r","dmg":{"name":"a.dmg","size":1,"sha256":"00"},"deltas":[],"entries":[]}"#.utf8))
+            let failure = ResultItem(date: Date(), kind: .launchFailure(program: "문서 변환기", launcherID: "a", environment: "공용 Wine 환경", logs: [], detail: "코드 1"))
+            let again = ResultItem(date: Date(), kind: .launchFailure(program: "문서 변환기", launcherID: "a", environment: "공용 Wine 환경", logs: [], detail: "코드 2"))
+            let candidate = InstalledCandidate(exe: URL(fileURLWithPath: "/nonexistent/app.exe"), title: "앱", shortcut: true)
+            let install = ResultItem(date: Date(), kind: .installFinished(installer: "설치.exe", environment: "공용 Wine 환경", environmentName: nil, candidates: [candidate]))
+            let update = ResultItem(date: Date(), kind: .updateAvailable(manifest))
+            try check(ResultsInbox.add(failure, to: &results) && ResultsInbox.add(install, to: &results) && ResultsInbox.add(update, to: &results) && results.count == 3, "results are added")
+            try check(ResultsInbox.add(again, to: &results) && results.count == 3 && results[0].id == again.id, "the same failure replaces the older one in place")
+            try check(!ResultsInbox.add(ResultItem(date: Date(), kind: .updateAvailable(manifest)), to: &results) && results.count == 3, "an update already listed for that build is not added twice")
+            let notice = ResultItem(date: Date(), kind: .notice(title: "알림", text: "내용"))
+            try check(ResultsInbox.add(notice, to: &results) && results.count == 4 && Set(results.map(\.key)).count == 4, "different events have different keys")
+            ResultsInbox.remove(install.id, from: &results)
+            try check(results.count == 3 && !results.contains { $0.id == install.id }, "a result is removed by its ID")
+            var many: [ResultItem] = []
+            for n in 0..<(ResultsInbox.limit + 5) { ResultsInbox.add(ResultItem(date: Date(), kind: .notice(title: "n\(n)", text: "")), to: &many) }
+            try check(many.count == ResultsInbox.limit && many.first?.key == "notice:n5", "the inbox keeps the newest results only")
+            try check(!ResultsInbox.shouldStore(windowVisible: true, appActive: true) && ResultsInbox.shouldStore(windowVisible: false, appActive: true)
+                      && ResultsInbox.shouldStore(windowVisible: true, appActive: false), "alerts show only with a visible window in the active app, otherwise results are stored")
+            let real = URL(fileURLWithPath: NSTemporaryDirectory())
+            try check(ResultsInbox.remainingCandidates([candidate, InstalledCandidate(exe: real, title: "있음", shortcut: false)], exists: { FileManager.default.fileExists(atPath: $0.path) }).map(\.title) == ["있음"],
+                      "candidates whose EXE vanished are dropped")
+
+            // Quit summary.
+            let quit = QuitSummary.text(sessions: [snap(own, "x", "Sample Game", stopping: true), snap(shared, "a", "사진 뷰어"), snap(other, "c", "회계 도구", preparing: true)],
+                                        place: { $0 == shared ? "공용 Wine 환경" : $0 == other ? "전용 Wine 환경 ‘account’" : "‘Sample Game’ 전용 Wine 환경" }, migrating: true)
+            try check(quit.contains("공용 Wine 환경 — 사진 뷰어 (실행 중)") && quit.contains("전용 Wine 환경 ‘account’ — 회계 도구 (준비 중)") && quit.contains("‘Sample Game’ 전용 Wine 환경 — Sample Game (종료 중)"), "the quit text lists each environment with its program and state")
+            try check(quit.contains("업데이트 전 상태로 복원") && !QuitSummary.text(sessions: [snap(shared, "a", "A")], place: { _ in "공용 Wine 환경" }, migrating: false).contains("복원")
+                      && QuitSummary.title == "실행 중인 프로그램을 모두 종료하고 Alchemac을 종료할까요?" && QuitSummary.confirmButton == "모두 종료하고 Alchemac 종료", "the environment-update warning appears only while one is running")
         }
         print("RESULT: \(passed) checks passed")
     }

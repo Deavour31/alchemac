@@ -47,7 +47,53 @@ final class LibraryModel: ObservableObject {
     /// Retina mode per Wine prefix path: shared, dedicated and programs' own prefixes.
     @Published var retina: [String: Bool] = [:]
 
-    init(store: LauncherStore) throws { self.store = store; registry = try store.read(); refreshRetina(); refreshAddons() }
+    init(store: LauncherStore) throws {
+        self.store = store; registry = try store.read(); refreshRetina(); refreshAddons()
+        session.failed = { [weak self] session, failure in self?.runFailed(session, failure) }
+    }
+
+    // MARK: Availability, results
+
+    /// Set by the app delegate: whether the library window is visible and the app is active.
+    var windowState: () -> (visible: Bool, active: Bool) = { (true, true) }
+    /// While true, what happens is shown at once (alert, status line). Otherwise it goes to `results` and no modal appears.
+    var presentNow: Bool { let state = windowState(); return !ResultsInbox.shouldStore(windowVisible: state.visible, appActive: state.active) }
+    /// Things the user has not seen because the window was hidden or the app inactive. In memory only.
+    @Published var results: [ResultItem] = []
+    /// The results sheet is open. (Kept here: the build has no SwiftUI macro plugin, so no @State.)
+    @Published var showingResults = false
+    func addResult(_ kind: ResultItem.Kind) { ResultsInbox.add(ResultItem(date: Date(), kind: kind), to: &results) }
+    func clearResult(_ id: UUID) {
+        if let item = results.first(where: { $0.id == id }), case .launchFailure(_, let launcherID?, _, _, _) = item.kind { session.dismissFailure(launcherID) }
+        ResultsInbox.remove(id, from: &results)
+    }
+    /// An alert now, or an entry in the results when the window is hidden or the app inactive.
+    func notify(_ title: String, _ text: String, style: NSAlert.Style = .informational) {
+        guard presentNow else { addResult(.notice(title: title, text: text)); return }
+        let alert = NSAlert(); alert.alertStyle = style; alert.messageText = title; alert.informativeText = text; alert.runModal()
+    }
+    private func runFailed(_ ended: Session, _ failure: RunFailure) {
+        guard !presentNow else { return }
+        addResult(.launchFailure(program: ended.launcherID.flatMap(launcher(id:))?.name ?? ended.title, launcherID: ended.launcherID,
+                                 environment: place(prefix: ended.prefix), logs: failure.logs, detail: failure.summary))
+    }
+
+    func launcher(id: String) -> Launcher? { registry.launchers.first { $0.id == id } }
+    func snapshots(accurate: Bool = false) -> [SessionSnapshot] { session.sessions.values.map { $0.snapshot(accurate: accurate) } }
+    func prefixPath(_ launcher: Launcher) -> String? { (try? store.prefix(launcher))?.standardizedFileURL.path }
+    /// The one place that decides what a program may do; buttons, menus and the commands themselves ask it.
+    func availability(for launcher: Launcher) -> ProgramAvailability {
+        ProgramAvailability.make(launcherID: launcher.id, prefix: prefixPath(launcher), sessions: snapshots(), task: task?.name, updating: updating, maintenance: session.maintenance)
+    }
+    func rowStatus(for launcher: Launcher) -> RowStatus {
+        RowStatus.make(launcherID: launcher.id, prefix: prefixPath(launcher), sessions: snapshots(), failed: session.failures[launcher.id] != nil)
+    }
+    /// After an alert or a file panel: the program must still exist and sit in the same Wine environment.
+    private func stillSame(_ id: String, prefix: String?) -> Launcher? {
+        guard let current = launcher(id: id), prefixPath(current) == prefix else { return nil }
+        return current
+    }
+    private func changed() { self.error(AlchemacError.message("그 사이 상태가 바뀌어 작업을 취소했습니다. 다시 시도해 주세요.")) }
     func loadIcon(_ launcher: Launcher) async {
         guard icons[launcher.id] == nil, let exe = try? store.executable(launcher), let dir = try? store.directory(launcher) else { return }
         let png = await Task.detached(priority: .utility) { ExeIcon.cachedPNG(exe: exe, dir: dir) }.value
@@ -66,11 +112,22 @@ final class LibraryModel: ObservableObject {
     func retinaOn(_ launcher: Launcher) -> Bool { (try? store.prefix(launcher)).map(retinaOn(prefix:)) ?? false }
     func place(_ environment: String?) -> String { environment.map { "전용 Wine 환경 ‘\($0)’" } ?? "공용 Wine 환경" }
     func place(_ launcher: Launcher) -> String { launcher.privatePrefix ? "‘\(launcher.name)’ 전용 Wine 환경" : place(launcher.environment) }
+    /// The plain name of the Wine environment at a prefix path (a session's), by comparing with the known ones.
+    func place(prefix path: String) -> String {
+        func same(_ url: URL) -> Bool { url.standardizedFileURL.path == path }
+        if same(store.sharedPrefix) { return place(nil as String?) }
+        if let name = store.environments().first(where: { same(store.prefix(environment: $0)) }) { return place(name) }
+        if let owner = registry.launchers.first(where: { $0.privatePrefix && (try? store.prefix($0)).map(same) == true }) { return place(owner) }
+        return "Wine 환경"
+    }
     func toggleRetina(environment: String?) { toggleRetina(prefix: store.prefix(environment: environment), place: place(environment)) }
-    func toggleRetina(_ launcher: Launcher) {
-        guard let prefix = try? store.prefix(launcher) else { return }
+    func toggleRetina(id: String) {
+        guard let launcher = launcher(id: id), let prefix = try? store.prefix(launcher) else { return }
+        let can = availability(for: launcher)
+        guard can.canToggleRetina else { if let reason = can.retinaReason { session.message = reason }; return }
         toggleRetina(prefix: prefix, place: place(launcher))
     }
+    func toggleRetina() { if let id = registry.selectedID { toggleRetina(id: id) } }
     func toggleRetina(prefix: URL, place: String) {
         guard FileManager.default.fileExists(atPath: prefix.appendingPathComponent("system.reg").path) else {
             self.error(AlchemacError.message("이 Wine 환경이 아직 만들어지지 않았습니다(\(place)). 프로그램을 한 번 실행한 뒤 다시 시도해 주세요.")); return
@@ -171,16 +228,19 @@ final class LibraryModel: ObservableObject {
             }
         } catch { self.error(error) }
     }
-    func toggleScaled() {
-        guard let selected, let index = registry.launchers.firstIndex(where: { $0.id == selected.id }) else { return }
+    func toggleScaled(id: String) {
+        guard let index = registry.launchers.firstIndex(where: { $0.id == id }), availability(for: registry.launchers[index]).canToggleScaled else { return }
+        let name = registry.launchers[index].name
         registry.launchers[index].scaled.toggle(); save()
         session.message = registry.launchers[index].scaled
-            ? "\(selected.name): 크기 보정을 켰습니다. 다음 실행부터 화면을 확대해 표시합니다. 글자와 이미지가 조금 흐려질 수 있습니다."
-            : "\(selected.name): 크기 보정을 껐습니다. 다음 실행부터 프로그램 자체 해상도로 표시합니다."
+            ? "\(name): 크기 보정을 켰습니다. 다음 실행부터 화면을 확대해 표시합니다. 글자와 이미지가 조금 흐려질 수 있습니다."
+            : "\(name): 크기 보정을 껐습니다. 다음 실행부터 프로그램 자체 해상도로 표시합니다."
     }
+    func toggleScaled() { if let id = registry.selectedID { toggleScaled(id: id) } }
     var selected: Launcher? { registry.launchers.first { $0.id == registry.selectedID } }
 
     func error(_ error: Error) {
+        guard presentNow else { addResult(.notice(title: "작업을 완료하지 못했습니다", text: error.localizedDescription)); return }
         if let interrupted = error as? MigrationInterrupted { recoverMigration(interrupted.prefix, retry: nil); return }
         if let orphan = error as? OrphanSession { offerOrphanStop([(environmentTitle(orphan.prefix), orphan.prefix)], startup: false); return }
         let alert = NSAlert(); alert.messageText = "작업을 완료하지 못했습니다"
@@ -192,28 +252,31 @@ final class LibraryModel: ObservableObject {
         let alert = NSAlert(); alert.alertStyle = .warning
         alert.messageText = "이 Wine 환경의 업데이트가 중간에 멈췄습니다"
         let unlockOnly = retry == nil
-        alert.informativeText = "앱을 업데이트한 뒤 첫 실행에서 Wine 환경을 새 버전에 맞추는 작업이 끝나기 전에 중단돼 환경이 잠겨 있습니다. "
+        alert.informativeText = "앱을 업데이트한 뒤 첫 실행에서 Wine 환경을 새 버전에 맞추는 작업이 끝나기 전에 중단돼 이 Wine 환경이 잠겨 있습니다. "
             + (unlockOnly
                 ? "‘잠금 해제’는 잠금만 풀 뿐 프로그램을 실행하지 않습니다. 풀고 나서 프로그램을 직접 다시 실행하면 작업을 처음부터 다시 합니다. "
                 : "‘다시 시도’는 작업을 처음부터 다시 하고, ")
-            + "‘업데이트 전 상태로 복원’은 작업 직전에 만들어 둔 백업으로 환경을 되돌립니다."
-        alert.addButton(withTitle: unlockOnly ? "잠금 해제" : "다시 시도"); alert.addButton(withTitle: "업데이트 전 상태로 복원"); alert.addButton(withTitle: "취소")
-        let choice = alert.runModal()
+            + "‘업데이트 전 상태로 복원’은 작업 직전에 만들어 둔 백업으로 Wine 환경을 되돌립니다."
+        alert.addButton(withTitle: unlockOnly ? "잠금 해제" : "다시 시도"); alert.addButton(withTitle: "업데이트 전 상태로 복원")
+        alert.addButton(withTitle: "Wine 환경 폴더 보기"); alert.addButton(withTitle: "취소")
+        var choice = alert.runModal()
+        // Looking at the folder does not decide anything: the same choices come back.
+        while choice == .alertThirdButtonReturn { NSWorkspace.shared.open(prefix); choice = alert.runModal() }
         guard choice == .alertFirstButtonReturn || choice == .alertSecondButtonReturn else { return }
         func fail(_ text: String) {
             let failed = NSAlert(); failed.alertStyle = .warning; failed.messageText = "작업을 완료하지 못했습니다"; failed.informativeText = text; failed.runModal()
         }
-        guard session.session(in: prefix) == nil else { return fail("이 환경을 쓰는 프로그램이 실행 중입니다. 먼저 종료해 주세요.") }
+        guard session.session(in: prefix) == nil else { return fail("이 Wine 환경을 쓰는 프로그램이 실행 중입니다. 먼저 종료해 주세요.") }
         if choice == .alertFirstButtonReturn {
             do { try PrefixMigration.clearMarker(prefix) } catch { if error is OrphanSession { self.error(error); return }; return fail(error.localizedDescription) }
             if let retry { retry() } else { session.message = "잠금을 풀었습니다. 프로그램을 다시 실행해 주세요." }
             return
         }
         guard let snapshot = PrefixMigration.snapshot(for: prefix, store: store) else {
-            return fail("기록된 백업 폴더를 복원에 쓸 수 없습니다. 백업이 없어졌거나 이 환경의 백업이 아닙니다. 아무것도 바꾸지 않았습니다. ‘다시 시도’를 고르거나, 환경 폴더 옆의 ‘.backup.’ 폴더를 확인해 주세요.")
+            return fail("기록된 백업 폴더를 복원에 쓸 수 없습니다. 백업이 없어졌거나 이 Wine 환경의 백업이 아닙니다. 아무것도 바꾸지 않았습니다. ‘다시 시도’를 고르거나, ‘Wine 환경 폴더 보기’로 옆의 ‘.backup.’ 폴더를 확인해 주세요.")
         }
         let confirm = NSAlert(); confirm.alertStyle = .warning; confirm.messageText = "업데이트 전 상태로 복원할까요?"
-        confirm.informativeText = "지금 환경은 휴지통으로 옮기고, 백업 ‘\(snapshot.lastPathComponent)’의 복사본을 그 자리에 둡니다. 백업 폴더는 그대로 남습니다."
+        confirm.informativeText = "지금 Wine 환경은 휴지통으로 옮기고, 백업 ‘\(snapshot.lastPathComponent)’의 복사본을 그 자리에 둡니다. 백업 폴더는 그대로 남습니다."
         confirm.addButton(withTitle: "복원"); confirm.addButton(withTitle: "취소")
         guard confirm.runModal() == .alertFirstButtonReturn else { return }
         do {
@@ -270,8 +333,7 @@ final class LibraryModel: ObservableObject {
             if !stuck.isEmpty { problems.append("세션이 아직 끝나지 않았습니다. 잠시 후 다시 시도하거나 Mac을 다시 시작해 주세요.\n" + stuck.map { "• " + $0 }.joined(separator: "\n")) }
             if problems.isEmpty { self.session.message = "남은 세션을 종료했습니다."; return }
             self.session.message = "남은 세션을 모두 종료하지 못했습니다."
-            let alert = NSAlert(); alert.alertStyle = .warning; alert.messageText = "남은 세션을 모두 종료하지 못했습니다"
-            alert.informativeText = problems.joined(separator: "\n\n"); alert.runModal()
+            self.notify("남은 세션을 모두 종료하지 못했습니다", problems.joined(separator: "\n\n"), style: .warning)
         }
     }
 
@@ -282,10 +344,10 @@ final class LibraryModel: ObservableObject {
     func startCleanup() {
         guard !session.maintenance else { return }
         session.maintenance = true
-        let store = self.store, runtime = AlchemacRuntime.root
+        let store = self.store, runtime = AlchemacRuntime.root, keep = keepPreviousApps
         DispatchQueue.global(qos: .utility).async {
             let summary = StartupCleanup.run(store: store, runtime: runtime)
-            Updater.cleanup()
+            Updater.cleanup(trashPrevious: !keep)
             DispatchQueue.main.async {
                 self.session.maintenance = false
                 if summary.freed > 500_000_000, !self.session.busy { self.session.message = "이전 런타임 사본 등 약 \(Self.size(summary.freed))를 정리했습니다." }
@@ -295,10 +357,6 @@ final class LibraryModel: ObservableObject {
 
     // MARK: Updates
 
-    private func alert(_ title: String, _ text: String, style: NSAlert.Style = .informational) {
-        let alert = NSAlert(); alert.alertStyle = style; alert.messageText = title; alert.informativeText = text; alert.runModal()
-    }
-
     /// Automatic check, a short while after launch: silent unless a newer version is found.
     func scheduleAutomaticUpdateCheck() {
         Task { [weak self] in
@@ -306,7 +364,8 @@ final class LibraryModel: ObservableObject {
             guard let self else { return }
             let last = UserDefaults.standard.object(forKey: Updater.lastCheckKey) as? Date
             guard Updater.shouldCheckAutomatically(enabled: self.automaticUpdateCheck, development: AlchemacRuntime.isDevelopment, last: last),
-                  !self.session.busy, !self.importing, !self.updating else { return }
+                  !self.importing, !self.updating else { return }
+            // A running program or a hidden window no longer drops the check: what it finds goes to the results.
             self.checkForUpdate(manual: false)
         }
     }
@@ -322,19 +381,23 @@ final class LibraryModel: ObservableObject {
                 UserDefaults.standard.set(Date(), forKey: Updater.lastCheckKey)
                 switch found {
                 case .available(let manifest):
-                    if manual || !self.session.busy { self.offerUpdate(manifest) }
+                    if self.presentNow, manual || !self.session.busy { _ = self.offerUpdate(manifest) }
+                    else { self.addResult(.updateAvailable(manifest)) }
                 case .needsSystem(let version):
                     // The automatic check stays silent: nothing the user can do about it.
-                    if manual { self.alert("업데이트를 설치할 수 없습니다", "이 업데이트는 macOS \(version) 이상이 필요합니다. 현재 이 Mac에서는 설치할 수 없습니다.") }
+                    if manual { self.notify("업데이트를 설치할 수 없습니다", "이 업데이트는 macOS \(version) 이상이 필요합니다. 현재 이 Mac에서는 설치할 수 없습니다.") }
                 case .upToDate:
-                    if manual { self.alert("최신 버전입니다", "현재 버전은 v\(AlchemacRuntime.appVersion)입니다. 가장 최신 버전입니다.") }
+                    if manual { self.notify("최신 버전입니다", "현재 버전은 v\(AlchemacRuntime.appVersion)입니다. 가장 최신 버전입니다.") }
                 }
             } catch {
                 fputs("Alchemac: update check failed: \(error.localizedDescription)\n", stderr)
-                if manual { self.alert("업데이트를 확인하지 못했습니다", error.localizedDescription, style: .warning) }
+                if manual { self.notify("업데이트를 확인하지 못했습니다", error.localizedDescription, style: .warning) }
             }
         }
     }
+
+    /// Set when the update helper could not put the previous app back: its copy in updates/previous must not be trashed yet.
+    private var keepPreviousApps = false
 
     /// Once at launch: what the update helper recorded about the last install attempt (the file is read and removed).
     func reportInstallResult() {
@@ -346,15 +409,27 @@ final class LibraryModel: ObservableObject {
         case .failed(let outcome):
             let detail: String
             switch outcome {
+            case "restore-failed":
+                keepPreviousApps = true
+                let folder = Updater.updatesFolder.appendingPathComponent("previous", isDirectory: true)
+                let alert = NSAlert(); alert.alertStyle = .critical
+                alert.messageText = "업데이트를 설치하지 못했고 이전 버전도 되돌리지 못했습니다"
+                alert.informativeText = "업데이트를 적용하는 중 문제가 생겼고, 이전 버전 앱을 원래 위치로 되돌리지도 못했습니다. 이전 버전 앱은 아래 폴더에 남아 있습니다.\n\n"
+                    + (folder.path as NSString).abbreviatingWithTildeInPath
+                    + "\n(updates/previous/ 안의 ‘Alchemac-…app’)\n\n그 앱을 응용 프로그램 폴더 등 원하는 위치로 옮기면 계속 쓸 수 있습니다. 이번 실행에서는 이 폴더를 정리하지 않지만, 그대로 두면 다음 실행 때 휴지통으로 옮겨질 수 있으니 먼저 옮겨 주세요. 지금 실행 중인 앱 v\(version)은 그대로 쓸 수 있습니다."
+                alert.addButton(withTitle: "폴더 보기"); alert.addButton(withTitle: "닫기")
+                if alert.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.open(folder) }
+                return
             case "restored": detail = "업데이트를 적용하는 중 문제가 생겨 이전 버전을 복원했습니다."
             case "not-started": detail = "업데이트를 시작하지 못해 이전 버전을 그대로 유지했습니다."
             default: detail = "업데이트가 적용되지 않아 이전 버전이 계속 실행되고 있습니다."
             }
-            alert("업데이트를 설치하지 못했습니다", detail + "\n현재 버전은 v\(version)입니다. 잠시 뒤 ‘관리’ 메뉴의 ‘업데이트 확인…’으로 다시 시도해 주세요.", style: .warning)
+            notify("업데이트를 설치하지 못했습니다", detail + "\n현재 버전은 v\(version)입니다. 잠시 뒤 ‘관리’ 메뉴의 ‘업데이트 확인…’으로 다시 시도해 주세요.", style: .warning)
         }
     }
 
-    private func offerUpdate(_ manifest: UpdateManifest) {
+    /// Returns true when the user chose "업데이트" (the update was started).
+    func offerUpdate(_ manifest: UpdateManifest) -> Bool {
         let build = AlchemacRuntime.appBuild
         let size = manifest.delta(fromBuild: build)?.size ?? manifest.dmg.size
         let alert = NSAlert(); alert.messageText = "Alchemac \(manifest.version) 업데이트를 사용할 수 있습니다"
@@ -366,19 +441,19 @@ final class LibraryModel: ObservableObject {
                 if let url = URL(string: manifest.releaseURL) { NSWorkspace.shared.open(url) }
                 continue
             }
-            if choice == .alertFirstButtonReturn { startUpdate(manifest) }
-            return
+            if choice == .alertFirstButtonReturn { startUpdate(manifest); return true }
+            return false
         }
     }
 
     /// Never stops a session itself: with one running, the user is asked to quit programs first.
     private func refuseWhileBusy() -> Bool {
         if session.busy {
-            alert("실행 중인 프로그램이 있습니다", "업데이트하려면 실행 중인 프로그램을 먼저 모두 종료해 주세요.", style: .warning)
+            notify("실행 중인 프로그램이 있습니다", "업데이트하려면 실행 중인 프로그램을 먼저 모두 종료해 주세요.", style: .warning)
             return true
         }
         if let task {
-            alert("다른 작업이 진행 중입니다", "‘\(task.name)’ 작업이 끝난 뒤 다시 시도해 주세요.", style: .warning)
+            notify("다른 작업이 진행 중입니다", "‘\(task.name)’ 작업이 끝난 뒤 다시 시도해 주세요.", style: .warning)
             return true
         }
         return false
@@ -409,7 +484,7 @@ final class LibraryModel: ObservableObject {
                 if alert.runModal() == .alertFirstButtonReturn, let url = URL(string: manifest.releaseURL) { NSWorkspace.shared.open(url) }
             } catch {
                 self.updating = false
-                self.alert("업데이트하지 못했습니다", error.localizedDescription + "\n\n현재 앱은 그대로입니다.", style: .warning)
+                self.notify("업데이트하지 못했습니다", error.localizedDescription + "\n\n현재 앱은 그대로입니다.", style: .warning)
             }
         }
     }
@@ -467,21 +542,22 @@ final class LibraryModel: ObservableObject {
                 if !result.2.isEmpty { text += "\n옮기지 못함: " + result.2.joined(separator: ", ") }
                 self.session.message = text
                 if !result.1.isEmpty || !result.2.isEmpty {
-                    let note = NSAlert(); note.alertStyle = .warning; note.messageText = "일부 환경의 백업을 정리하지 못했습니다"; note.informativeText = text; note.runModal()
+                    self.notify("일부 환경의 백업을 정리하지 못했습니다", text, style: .warning)
                 }
             }
         }
     }
 
     func save() { do { try store.write(registry) } catch { self.error(error) } }
-    func start() {
-        guard let selected, !updating, !session.maintenance else { return }
+    func start() { if let id = registry.selectedID { start(id: id) } }
+    func start(id: String) {
+        guard let selected = launcher(id: id), availability(for: selected).canRun else { return }
         // An add-on can ask for an English layout for programs that fail on a Korean one.
         let wantsEnglish = selected.addon.flatMap(store.addon)?.englishInput ?? false
         let switched = wantsEnglish ? EnglishInput.ensure() : nil
         do { try session.start(selected, store: store) }
         catch let interrupted as MigrationInterrupted {
-            recoverMigration(interrupted.prefix) { [weak self] in self?.start() }
+            recoverMigration(interrupted.prefix) { [weak self] in self?.start(id: id) }
             return
         } catch { self.error(error); return }
         if let exe = try? store.executable(selected), let prefix = try? store.prefix(selected), store.needsWineMono(exe, in: prefix) {
@@ -496,15 +572,24 @@ final class LibraryModel: ObservableObject {
         guard let selected, let prefix = try? store.prefix(selected) else { return nil }
         return session.session(in: prefix)
     }
-    func stop() {
-        guard let running = selectedSession else { return }
+    func stop() { if let id = registry.selectedID { stop(id: id) } }
+    func stop(id: String) {
+        guard let launcher = launcher(id: id), let prefix = try? store.prefix(launcher) else { return }
+        stopEnvironment(prefix: prefix)
+    }
+    /// Stops every program of the session that holds this Wine environment, after asking.
+    func stopEnvironment(prefix: URL) {
+        guard let running = session.session(in: prefix), !running.stopping else { return }
         let alert = NSAlert(); alert.messageText = "이 Wine 환경의 프로그램을 모두 종료할까요?"
         alert.informativeText = "이 Wine 환경에서 이 앱이 시작한 프로그램(‘\(running.title)’ 등)이 모두 종료됩니다. 열려 있는 작업이나 게임이 있다면 먼저 저장해 주세요. 다른 Wine 환경의 프로그램은 계속 실행됩니다."
         if running.migrating {
             alert.informativeText += "\n\n지금은 앱 업데이트 후 Wine 환경을 새 버전에 맞추는 중입니다. 지금 종료하면 이 업데이트가 중단되며, 다음 실행 때 다시 시도하거나 업데이트 전 상태로 복원할 수 있습니다."
         }
         alert.addButton(withTitle: "모두 종료"); alert.addButton(withTitle: "취소")
-        if alert.runModal() == .alertFirstButtonReturn { session.stop(running) }
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        // The session may have ended (or another one started) while the alert was open: only this very session is stopped.
+        guard let current = session.session(in: prefix), current === running else { session.message = "그 사이 이 Wine 환경의 프로그램이 이미 끝났습니다."; return }
+        session.stop(current)
     }
     func add() {
         let panel = NSOpenPanel()
@@ -576,23 +661,27 @@ final class LibraryModel: ObservableObject {
             guard let self else { return }
             let environment = choice.name, before = self.store.installedExecutables(in: environment)
             do {
-                try self.session.install(file, environment: environment, store: self.store) { [weak self] in self?.offerInstalled(since: before, in: environment) }
+                try self.session.install(file, environment: environment, store: self.store) { [weak self] in self?.offerInstalled(since: before, in: environment, installer: file.lastPathComponent) }
             } catch { self.error(error) }
         }
     }
     /// Runs a patch or tool EXE in the selected program's own Wine environment.
-    func runTool() {
-        guard let launcher = selected else { return }
+    func runTool() { if let id = registry.selectedID { runTool(id: id) } }
+    func runTool(id: String) {
+        guard let first = launcher(id: id), availability(for: first).canRunTool, let prefix = try? store.prefix(first) else { return }
+        let launcher = first
         let panel = NSOpenPanel()
         panel.title = "‘\(launcher.name)’ 환경에서 실행할 EXE 선택"
         panel.message = "패치나 도구를 이 프로그램과 같은 Wine 환경에서 실행합니다. 프로그램이 실행 중이면 그 세션에 합류합니다. 선택한 파일은 수정하지 않습니다."
         panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let file = panel.url else { return }
-        if let id = launcher.addon, store.addon(id)?.englishInput == true, let name = EnglishInput.ensure() {
+        // The panel can stay open for a long time: the program and its environment's state are checked again.
+        guard let launcher = stillSame(id, prefix: prefix.standardizedFileURL.path), availability(for: launcher).canRunTool else { changed(); return }
+        if let addonID = launcher.addon, store.addon(addonID)?.englishInput == true, let name = EnglishInput.ensure() {
             session.message = "입력 소스를 바꿨습니다: \(name)"
         }
         do {
-            if let running = selectedSession {
+            if let running = session.session(in: prefix) {
                 guard !running.stopping else { throw AlchemacError.message("세션을 종료하는 중입니다. 끝난 뒤 다시 시도해 주세요.") }
                 try session.attachTool(file, for: launcher, store: store)
             } else {
@@ -659,56 +748,96 @@ final class LibraryModel: ObservableObject {
         guard choice.fresh, choice.retina else { then(); return }
         applyRetina(true, prefix: store.prefix(environment: choice.name), place: place(choice.name)) { ok in if ok { then() } }
     }
-    /// After an installer: offer what it added, named after its shortcuts.
-    func offerInstalled(since before: Set<String>, in environment: String?) {
+    /// After an installer: offer what it added, named after its shortcuts. With the window hidden or the app inactive
+    /// the candidates wait in the results (`chooseCandidates`) instead of opening an alert.
+    func offerInstalled(since before: Set<String>, in environment: String?, installer: String) {
         refreshRetina()
         let store = self.store
-        let registered = Set(registry.launchers.filter { $0.kind == .installed && $0.environment == environment }.map { $0.executable.lowercased() })
         DispatchQueue.global(qos: .userInitiated).async {
             let found = store.newPrograms(since: before, in: environment)
             DispatchQueue.main.async {
-                let fresh = found.filter { candidate in
-                    guard let location = store.installedLocation(of: candidate.exe) else { return false }
-                    return !registered.contains(location.path.lowercased())
-                }
+                let fresh = self.unregistered(found, in: environment)
                 guard !fresh.isEmpty else {
                     self.session.message += "\n새로 설치된 프로그램을 찾지 못했습니다. ‘프로그램 등록’에서 설치된 EXE를 직접 선택해 주세요."
                     return
                 }
-                let alert = NSAlert(); alert.messageText = "설치된 프로그램을 등록할까요?"
-                alert.informativeText = "설치 파일이 \(self.place(environment))에 추가한 프로그램입니다. 등록할 항목을 선택해 주세요."
-                let boxes = fresh.map { candidate -> NSButton in
-                    let box = NSButton(checkboxWithTitle: candidate.title, target: nil, action: nil)
-                    box.state = candidate.shortcut ? .on : .off
-                    box.toolTip = candidate.exe.path
-                    return box
+                guard self.presentNow else {
+                    self.addResult(.installFinished(installer: installer, environment: self.place(environment), environmentName: environment, candidates: fresh))
+                    return
                 }
-                let stack = NSStackView(views: boxes); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 6
-                stack.frame = NSRect(x: 0, y: 0, width: 340, height: CGFloat(boxes.count) * 24)
-                alert.accessoryView = stack
-                alert.addButton(withTitle: "등록"); alert.addButton(withTitle: "건너뛰기")
-                guard alert.runModal() == .alertFirstButtonReturn else { return }
-                var added: [Launcher] = []
-                for (candidate, box) in zip(fresh, boxes) where box.state == .on {
-                    do {
-                        var launcher = try store.importProgram(from: candidate.exe)
-                        launcher.name = candidate.title
-                        added.append(launcher)
-                    } catch { self.error(error) }
-                }
-                guard let last = added.last else { return }
-                self.registry.launchers += added; self.registry.selectedID = last.id; self.save()
-                self.session.message += "\n등록 완료: \(added.map(\.name).joined(separator: ", "))"
+                _ = self.presentCandidates(fresh, in: environment)
             }
         }
     }
-    /// Deletes the selected program the way its kind allows; files go to the Trash.
-    func deleteProgram() {
-        guard let selected, !session.isRunning(selected.id) else { return }
-        let programPrefix = try? store.prefix(selected)
-        if let prefix = programPrefix, let running = session.session(in: prefix) {
-            self.error(AlchemacError.message("같은 Wine 환경에서 실행 중인 프로그램이 있습니다: ‘\(running.title)’. 먼저 종료해 주세요.")); return
+    /// Candidates that are not registered yet.
+    private func unregistered(_ found: [InstalledCandidate], in environment: String?) -> [InstalledCandidate] {
+        let registered = Set(registry.launchers.filter { $0.kind == .installed && $0.environment == environment }.map { $0.executable.lowercased() })
+        return found.filter { candidate in
+            guard let location = store.installedLocation(of: candidate.exe) else { return false }
+            return !registered.contains(location.path.lowercased())
         }
+    }
+    /// "후보 선택…" in the results: the same chooser again, for the candidates whose files are still there and not registered.
+    /// Returns true when the item can go (registered, or nothing left to choose).
+    func chooseCandidates(_ itemID: UUID) -> Bool {
+        guard let item = results.first(where: { $0.id == itemID }), case .installFinished(_, _, let name, let candidates) = item.kind else { return true }
+        let existing = ResultsInbox.remainingCandidates(candidates) { FileManager.default.fileExists(atPath: $0.path) }
+        guard !existing.isEmpty else {
+            notify("설치된 프로그램을 찾을 수 없습니다", "설치 파일이 추가했던 프로그램의 파일이 지금은 없습니다. 설치 프로그램이 파일을 옮겼거나 지웠을 수 있습니다. 설치했다면 ‘프로그램 등록’에서 EXE를 직접 선택해 주세요.", style: .warning)
+            return true
+        }
+        let fresh = unregistered(existing, in: name)
+        guard !fresh.isEmpty else {
+            notify("이미 모두 등록했습니다", "이 설치 파일이 추가한 프로그램은 모두 목록에 있습니다.")
+            return true
+        }
+        return presentCandidates(fresh, in: name)
+    }
+    /// The chooser. Returns true when something was registered, false when skipped.
+    private func presentCandidates(_ fresh: [InstalledCandidate], in environment: String?) -> Bool {
+        let store = self.store
+        let alert = NSAlert(); alert.messageText = "설치된 프로그램을 등록할까요?"
+        alert.informativeText = "설치 파일이 \(place(environment))에 추가한 프로그램입니다. 등록할 항목을 선택해 주세요."
+        let boxes = fresh.map { candidate -> NSButton in
+            let box = NSButton(checkboxWithTitle: candidate.title, target: nil, action: nil)
+            box.state = candidate.shortcut ? .on : .off
+            box.toolTip = candidate.exe.path
+            return box
+        }
+        let stack = NSStackView(views: boxes); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 6
+        stack.frame = NSRect(x: 0, y: 0, width: 340, height: CGFloat(boxes.count) * 24)
+        alert.accessoryView = stack
+        alert.addButton(withTitle: "등록"); alert.addButton(withTitle: "건너뛰기")
+        guard alert.runModal() == .alertFirstButtonReturn else { return false }
+        var added: [Launcher] = []
+        for (candidate, box) in zip(fresh, boxes) where box.state == .on {
+            do {
+                var launcher = try store.importProgram(from: candidate.exe)
+                launcher.name = candidate.title
+                added.append(launcher)
+            } catch { self.error(error) }
+        }
+        guard let last = added.last else { return false }
+        registry.launchers += added; registry.selectedID = last.id; save()
+        session.message += "\n등록 완료: \(added.map(\.name).joined(separator: ", "))"
+        return true
+    }
+    /// "업데이트…" in the results: the normal offer. The item goes once the update was started.
+    func openUpdate(_ itemID: UUID) {
+        guard let item = results.first(where: { $0.id == itemID }), case .updateAvailable(let manifest) = item.kind else { return }
+        if offerUpdate(manifest) { ResultsInbox.remove(itemID, from: &results) }
+    }
+    func showResultLogs(_ logs: [URL]) {
+        let existing = logs.filter { FileManager.default.fileExists(atPath: $0.path) }
+        if existing.isEmpty { revealLogs() } else { NSWorkspace.shared.activateFileViewerSelecting(existing) }
+    }
+    /// Deletes the selected program the way its kind allows; files go to the Trash.
+    func deleteProgram() { if let id = registry.selectedID { deleteProgram(id: id) } }
+    func deleteProgram(id: String) {
+        guard let selected = launcher(id: id) else { return }
+        let can = availability(for: selected)
+        guard can.canDelete else { if let reason = can.deleteReason { self.error(AlchemacError.message(reason)) }; return }
+        let programPrefix = try? store.prefix(selected)
         if let prefix = programPrefix, PrefixMigration.isEnvironmentBusy(prefix) { self.error(OrphanSession(prefix: prefix)); return }
         let sharing = registry.launchers.filter { $0.id != selected.id && !$0.privatePrefix && $0.environment == selected.environment }
         let ownEnvironment = !selected.privatePrefix && selected.environment != nil && sharing.isEmpty
@@ -754,6 +883,8 @@ final class LibraryModel: ObservableObject {
         alert.addButton(withTitle: "취소")
         let index = alert.runModal().rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
         guard index >= 0, index < choices.count else { return }
+        // Re-checked after the alert: the same program in the same Wine environment, and nothing running there now.
+        guard stillSame(id, prefix: programPrefix?.standardizedFileURL.path) != nil, availability(for: selected).canDelete else { changed(); return }
         switch choices[index] {
         case .uninstall(let entry):
             do {
@@ -794,8 +925,9 @@ final class LibraryModel: ObservableObject {
         save()
     }
     static func size(_ bytes: Int64) -> String { ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file) }
-    func rename() {
-        guard let selected, let index = registry.launchers.firstIndex(where: { $0.id == selected.id }) else { return }
+    func rename() { if let id = registry.selectedID { rename(id: id) } }
+    func rename(id: String) {
+        guard let selected = launcher(id: id), availability(for: selected).canRename else { return }
         let alert = NSAlert(); alert.messageText = "프로그램 이름 변경"
         let field = NSTextField(string: selected.name); field.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
         field.setAccessibilityLabel("프로그램 이름")
@@ -804,22 +936,37 @@ final class LibraryModel: ObservableObject {
         while true {
             guard alert.runModal() == .alertFirstButtonReturn else { return }
             let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !name.isEmpty, name.count <= 80 { registry.launchers[index].name = name; save(); return }
+            if !name.isEmpty, name.count <= 80 {
+                // The alert may have stayed open while the list changed.
+                guard let index = registry.launchers.firstIndex(where: { $0.id == id }), availability(for: registry.launchers[index]).canRename else { changed(); return }
+                registry.launchers[index].name = name; save(); return
+            }
             alert.informativeText = "이름은 1~80자로 입력해 주세요."
         }
     }
-    func remove() {
-        guard let selected else { return }
+    func remove() { if let id = registry.selectedID { remove(id: id) } }
+    func remove(id: String) {
+        guard let selected = launcher(id: id), availability(for: selected).canRemove else { return }
+        let prefix = prefixPath(selected)
         let alert = NSAlert(); alert.messageText = "목록에서 제거할까요?"
         alert.informativeText = selected.kind == .installed
             ? "설치된 파일은 삭제하지 않습니다. \(place(selected))에 그대로 남습니다."
             : "프로그램 파일과 계정 데이터는 삭제하지 않습니다. 보관함 폴더에 남습니다."
         alert.addButton(withTitle: "목록에서 제거"); alert.addButton(withTitle: "취소")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        registry.launchers.removeAll { $0.id == selected.id }; registry.selectedID = registry.launchers.first?.id; save()
+        guard let current = stillSame(id, prefix: prefix), availability(for: current).canRemove else { changed(); return }
+        unregister(current)
     }
-    func revealGame() {
-        if let selected, let game = try? store.game(selected) { NSWorkspace.shared.open(game) }
+    func revealGame() { if let id = registry.selectedID { revealGame(id: id) } }
+    func revealGame(id: String) {
+        if let launcher = launcher(id: id), let game = try? store.game(launcher) { NSWorkspace.shared.open(game) }
+    }
+    func revealEnvironment(id: String) {
+        if let launcher = launcher(id: id), let prefix = try? store.prefix(launcher) { NSWorkspace.shared.open(prefix) }
+    }
+    func revealFailureLog(id: String) {
+        let logs = (session.failures[id]?.logs ?? []).filter { FileManager.default.fileExists(atPath: $0.path) }
+        if logs.isEmpty { revealLogs() } else { NSWorkspace.shared.activateFileViewerSelecting(logs) }
     }
     /// Selects the last problem run's own log files in Finder.
     func revealProblemLog() {
@@ -838,7 +985,110 @@ struct LibraryView: View {
     @ObservedObject var session: SessionController
     private var locked: Bool { model.importing || model.updating }
     private var preparing: Bool { session.maintenance && !locked }
-    private var selectedRunning: Bool { model.selected.map { session.isRunning($0.id) } ?? false }
+
+    static func time(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ko_KR"); formatter.doesRelativeDateFormatting = true
+        formatter.dateStyle = .short; formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+
+    @ViewBuilder private func badge(_ badge: RowStatus.Badge, failure: RunFailure?) -> some View {
+        let text = RowStatus.badgeText(badge)
+        let help = RowStatus.help(badge, time: failure.map { Self.time($0.date) })
+        HStack(spacing: 6) {
+            if badge == .failed { Image(systemName: "exclamationmark.triangle.fill") } else { ProgressView().controlSize(.small) }
+            Text(text).font(.caption)
+        }
+        .foregroundStyle(badge == .failed ? Color.orange : Color.teal)
+        .help(help).accessibilityElement(children: .ignore).accessibilityLabel(text + ". " + help)
+    }
+
+    @ViewBuilder private func row(_ launcher: Launcher) -> some View {
+        let status = model.rowStatus(for: launcher)
+        HStack(spacing: 12) {
+            Group {
+                if let icon = model.icons[launcher.id] {
+                    Image(nsImage: icon).resizable().interpolation(.high).scaledToFit().padding(5)
+                } else {
+                    Image(systemName: "gamecontroller.fill").font(.title2).foregroundStyle(.mint)
+                }
+            }.frame(width: 42, height: 42).background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+                .task(id: launcher.id + launcher.executable) { await model.loadIcon(launcher) }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(launcher.name).font(.headline)
+                Text(launcher.detail + (model.retinaOn(launcher) ? " · 선명한 화면" : "") + (launcher.scaled ? " · 크기 보정" : ""))
+                    .font(.caption).foregroundStyle(.secondary)
+                if let other = status.sharedWith {
+                    Text(RowStatus.sharedText(other)).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            if let state = status.badge { badge(state, failure: session.failures[launcher.id]) }
+        }
+        .padding(.vertical, 7)
+        .contentShape(Rectangle())
+        // Double-click runs this row, if it can run. simultaneousGesture keeps the single click selecting.
+        .simultaneousGesture(TapGesture(count: 2).onEnded { model.start(id: launcher.id) })
+        .contextMenu { rowMenu(launcher) }
+        .tag(launcher.id)
+    }
+
+    /// The menu of the right-clicked row (not of the selection), built from the same availability as the buttons.
+    @ViewBuilder private func rowMenu(_ launcher: Launcher) -> some View {
+        let can = model.availability(for: launcher)
+        let id = launcher.id
+        Button("실행") { model.start(id: id) }.disabled(!can.canRun).help(can.runReason ?? "")
+        Button("같은 Wine 환경에서 다른 EXE 실행…") { model.runTool(id: id) }.disabled(!can.canRunTool).help(can.toolReason ?? "")
+        if can.environmentSession != nil {
+            Button("이 Wine 환경의 프로그램 모두 종료…") { model.stop(id: id) }.disabled(!can.canStopEnvironment)
+        }
+        if session.failures[id] != nil {
+            Divider()
+            Button("오류 로그 보기") { model.revealFailureLog(id: id) }
+            Button("오류 표시 지우기") { session.dismissFailure(id) }
+        }
+        Divider()
+        Button("프로그램 폴더 보기") { model.revealGame(id: id) }
+        Button("이름 변경…") { model.rename(id: id) }.disabled(!can.canRename).help(can.modifyReason ?? "")
+        Menu("화면 설정") {
+            Section("‘\(launcher.name)’에만 적용") {
+                Button(launcher.scaled ? "크기 보정 끄기" : "크기 보정 켜기") { model.toggleScaled(id: id) }.disabled(!can.canToggleScaled)
+            }
+            Section("같은 Wine 환경의 모든 프로그램에 적용") {
+                Button(model.retinaOn(launcher) ? "선명한 화면(Retina) 끄기" : "선명한 화면(Retina) 켜기") { model.toggleRetina(id: id) }
+                    .disabled(!can.canToggleRetina).help(can.retinaReason ?? "")
+                if let reason = can.retinaReason { Text(reason) }
+            }
+        }
+        Button("환경 폴더 보기") { model.revealEnvironment(id: id) }
+        Divider()
+        Button("목록에서 제거…") { model.remove(id: id) }.disabled(!can.canRemove).help(can.modifyReason ?? "")
+        Button("프로그램 삭제…") { model.deleteProgram(id: id) }.disabled(!can.canDelete).help(can.deleteReason ?? "")
+    }
+
+    /// Installers, tools and registry jobs have no row: they get their own compact area, with a way to stop them.
+    @ViewBuilder private var unregisteredSessions: some View {
+        let loose = UnregisteredSessions.filter(model.snapshots(), registered: Set(model.registry.launchers.map(\.id)))
+        if !loose.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("목록에 없는 실행").font(.subheadline.weight(.semibold))
+                ForEach(loose, id: \.prefix) { entry in
+                    HStack(spacing: 10) {
+                        ProgressView().controlSize(.small)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(entry.title).font(.callout.weight(.medium)).lineLimit(1).truncationMode(.middle)
+                            Text(model.place(prefix: entry.prefix) + " · " + entry.phase.rawValue).font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("이 Wine 환경의 프로그램 모두 종료…") { model.stopEnvironment(prefix: URL(fileURLWithPath: entry.prefix, isDirectory: true)) }
+                            .disabled(entry.stopping)
+                    }
+                }
+            }.padding(10).frame(maxWidth: .infinity, alignment: .leading).background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             HStack(spacing: 14) {
@@ -855,57 +1105,43 @@ struct LibraryView: View {
             HStack {
                 Text("등록된 프로그램").font(.headline)
                 Spacer()
+                if !model.results.isEmpty {
+                    Button("확인할 결과 \(model.results.count)개…") { model.showingResults = true }
+                }
                 Button(action: model.install) { Label("설치 파일 실행", systemImage: "shippingbox") }.disabled(locked)
                 Button(action: model.add) { Label("프로그램 등록", systemImage: "plus") }.disabled(locked)
             }
             List(selection: $model.registry.selectedID) {
-                ForEach(model.registry.launchers) { launcher in
-                    HStack(spacing: 12) {
-                        Group {
-                            if let icon = model.icons[launcher.id] {
-                                Image(nsImage: icon).resizable().interpolation(.high).scaledToFit().padding(5)
-                            } else {
-                                Image(systemName: "gamecontroller.fill").font(.title2).foregroundStyle(.mint)
-                            }
-                        }.frame(width: 42, height: 42).background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
-                            .task(id: launcher.id + launcher.executable) { await model.loadIcon(launcher) }
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(launcher.name).font(.headline)
-                            Text(launcher.detail + (model.retinaOn(launcher) ? " · 선명한 화면" : "") + (launcher.scaled ? " · 크기 보정" : ""))
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        if session.isRunning(launcher.id) {
-                            ProgressView().controlSize(.small)
-                            Text("실행 중").font(.caption).foregroundStyle(.teal)
-                        }
-                    }.padding(.vertical, 7).tag(launcher.id)
-                }
+                ForEach(model.registry.launchers) { launcher in row(launcher) }
             }
             .listStyle(.inset).frame(minHeight: 145)
             .overlay {
                 if model.registry.launchers.isEmpty {
                     VStack(spacing: 8) {
                         Image(systemName: "tray").font(.largeTitle).foregroundStyle(.secondary)
-                        Text("등록된 프로그램이 없습니다").font(.headline)
-                        Text("‘설치 파일 실행’으로 설치하거나 ‘프로그램 등록’에서 EXE를 선택하세요.").font(.caption).foregroundStyle(.secondary)
+                        Text("아직 등록된 프로그램이 없습니다").font(.headline)
+                        Text("설치가 필요하면 ‘설치 파일 실행’을 선택해 주세요.\n이미 설치했거나 압축을 푼 프로그램은 ‘프로그램 등록’을 선택해 주세요.")
+                            .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
                     }
                 }
             }.disabled(locked)
             .onChange(of: model.registry.selectedID) { _, _ in model.save() }
+            unregisteredSessions
             HStack {
-                Button("프로그램 폴더", action: model.revealGame).disabled(model.selected == nil)
+                let selected = model.selected
+                let can = selected.map { model.availability(for: $0) }
+                Button("프로그램 폴더") { if let selected { model.revealGame(id: selected.id) } }.disabled(selected == nil)
                 Menu("관리") {
-                    Button("이름 변경", action: model.rename).disabled(locked || selectedRunning || model.selected == nil)
-                    Button("목록에서 제거", action: model.remove).disabled(locked || selectedRunning || model.selected == nil)
-                    Button("프로그램 삭제…", action: model.deleteProgram).disabled(locked || selectedRunning || model.selected == nil)
-                    Button("이 프로그램 환경에서 EXE 실행…", action: model.runTool).disabled(locked || model.selected == nil || model.selectedSession?.stopping == true)
-                    if let selected = model.selected {
+                    Button("이름 변경") { model.rename() }.disabled(!(can?.canRename ?? false)).help(can?.modifyReason ?? "")
+                    Button("목록에서 제거") { model.remove() }.disabled(!(can?.canRemove ?? false)).help(can?.modifyReason ?? "")
+                    Button("프로그램 삭제…") { model.deleteProgram() }.disabled(!(can?.canDelete ?? false)).help(can?.deleteReason ?? "")
+                    Button("같은 Wine 환경에서 다른 EXE 실행…") { model.runTool() }.disabled(!(can?.canRunTool ?? false)).help(can?.toolReason ?? "")
+                    if let selected, let can {
                         Divider()
                         let scope = selected.privatePrefix ? "이 프로그램 Wine 환경의" : "이 Wine 환경의"
-                        Button(model.retinaOn(selected) ? scope + " 선명한 화면 끄기" : scope + " 선명한 화면(Retina) 켜기",
-                               action: { model.toggleRetina(selected) }).disabled(locked || model.selectedSession != nil)
-                        Button(selected.scaled ? "크기 보정 끄기" : "크기 보정 켜기 (작게 보일 때)", action: model.toggleScaled).disabled(locked)
+                        Button(model.retinaOn(selected) ? scope + " 선명한 화면 끄기" : scope + " 선명한 화면(Retina) 켜기") { model.toggleRetina() }
+                            .disabled(!can.canToggleRetina).help(can.retinaReason ?? "")
+                        Button(selected.scaled ? "크기 보정 끄기" : "크기 보정 켜기 (작게 보일 때)") { model.toggleScaled() }.disabled(!can.canToggleScaled)
                     }
                     Divider()
                     Button("최근 오류 로그 보기", action: model.revealProblemLog).disabled(session.lastProblemLogs.isEmpty)
@@ -945,24 +1181,21 @@ struct LibraryView: View {
                     Button("환경 백업 정리…", action: model.manageBackups).disabled(locked)
                 }.fixedSize()
                 Spacer()
-                if let running = model.selectedSession {
-                    if running.launcherID != model.selected?.id {
-                        Text("같은 Wine 환경에서 ‘\(running.title)’ 실행 중").font(.caption).foregroundStyle(.secondary)
+                if let selected, let can {
+                    if can.environmentSession != nil {
+                        Button("이 Wine 환경의 프로그램 모두 종료…") { model.stop(id: selected.id) }.disabled(!can.canStopEnvironment)
+                    } else {
+                        Button { model.start(id: selected.id) } label: { Label("선택한 프로그램 실행", systemImage: "play.fill") }
+                            .buttonStyle(.borderedProminent).tint(.teal).disabled(!can.canRun).help(can.runReason ?? "")
                     }
-                    Button("세션 종료", action: model.stop).disabled(running.stopping)
                 } else {
-                    Button(action: model.start) { Label("선택한 프로그램 실행", systemImage: "play.fill") }
-                        .buttonStyle(.borderedProminent).tint(.teal).disabled(model.selected == nil || locked || session.maintenance)
+                    Button { } label: { Label("선택한 프로그램 실행", systemImage: "play.fill") }.buttonStyle(.borderedProminent).tint(.teal).disabled(true)
                 }
             }
             Divider()
             HStack(alignment: .top, spacing: 8) {
                 if locked || session.busy || session.maintenance { ProgressView().controlSize(.small) }
                 VStack(alignment: .leading, spacing: 2) {
-                    if session.sessions.count > 1 {
-                        Text("동시에 실행 중 \(session.sessions.count)개: " + session.sessions.values.map(\.title).sorted().joined(separator: ", "))
-                            .font(.caption.weight(.medium))
-                    }
                     Text(model.importing ? model.importMessage : model.updating ? model.updateMessage : preparing ? "보관함을 준비하는 중입니다…" : session.message).font(.callout).foregroundStyle(.secondary)
                         .textSelection(.enabled)
                     if !locked, !session.busy, !session.lastProblemLogs.isEmpty {
@@ -981,6 +1214,58 @@ struct LibraryView: View {
                 .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
         }
         .padding(26).frame(minWidth: 590, minHeight: 480)
+        .sheet(isPresented: $model.showingResults) { ResultsView(model: model) { model.showingResults = false } }
+        .onChange(of: model.results.isEmpty) { _, empty in if empty { model.showingResults = false } }
+    }
+}
+
+/// "확인할 결과": what happened while the window was hidden or the app inactive, until the user clears it.
+struct ResultsView: View {
+    @ObservedObject var model: LibraryModel
+    let close: () -> Void
+
+    private func describe(_ item: ResultItem) -> (title: String, subtitle: String, detail: String?, action: (label: String, run: () -> Void)?) {
+        let time = LibraryView.time(item.date)
+        switch item.kind {
+        case .launchFailure(let program, _, let environment, let logs, let detail):
+            return ("‘\(program)’ 실행 오류", environment + " · " + time, detail, ("로그 보기", { model.showResultLogs(logs) }))
+        case .installFinished(let installer, let environment, _, let candidates):
+            return ("설치가 끝났습니다 · 등록할 후보 \(candidates.count)개", environment + " · " + time, "설치 파일: " + installer,
+                    ("후보 선택…", { if model.chooseCandidates(item.id) { model.clearResult(item.id) } }))
+        case .updateAvailable(let manifest):
+            return ("Alchemac \(manifest.version) 업데이트", time, "새 버전을 사용할 수 있습니다.", ("업데이트…", { model.openUpdate(item.id) }))
+        case .notice(let title, let text):
+            return (title, time, text, nil)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("확인할 결과").font(.title3.weight(.semibold))
+                Spacer()
+                Button("닫기", action: close).keyboardShortcut(.cancelAction)
+            }
+            List {
+                ForEach(model.results) { item in
+                    let info = describe(item)
+                    HStack(alignment: .top, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(info.title).font(.headline)
+                            Text(info.subtitle).font(.caption).foregroundStyle(.secondary)
+                            if let detail = info.detail { Text(detail).font(.callout).foregroundStyle(.secondary).lineLimit(4).textSelection(.enabled) }
+                        }
+                        Spacer()
+                        if let action = info.action {
+                            // The sheet closes first: the action may open an alert or a panel of its own.
+                            Button(action.label) { close(); DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { action.run() } }
+                        }
+                        Button("지우기") { model.clearResult(item.id) }
+                    }.padding(.vertical, 6)
+                }
+            }.listStyle(.inset)
+        }
+        .padding(22).frame(minWidth: 540, minHeight: 320)
     }
 }
 
@@ -994,6 +1279,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         do {
             Updater.registerDefaults()
             let model = try LibraryModel(store: LauncherStore()); self.model = model
+            model.windowState = { [weak self] in
+                (self?.window.map { $0.isVisible && !$0.isMiniaturized } ?? false, NSApp.isActive)
+            }
             model.session.finished = { [weak self] in
                 guard let self, self.waitingToQuit else { return }
                 NSApp.reply(toApplicationShouldTerminate: true)
@@ -1016,29 +1304,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             alert.runModal(); NSApp.terminate(nil)
         }
     }
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
-        window?.makeKeyAndOrderFront(nil); return true
+
+    /// The one library window: brought back from the Dock, the minimized state or a closed window; the model is the same.
+    func showLibrary() {
+        guard let window else { return }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
     }
-    func windowShouldClose(_ sender: NSWindow) -> Bool { NSApp.terminate(nil); return false }
+    @objc func showLibraryMenu(_ sender: Any?) { showLibrary() }
+
+    // Closing the window only closes it: the app stays in the Dock and sessions keep running. Quit with ⌘Q.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool { showLibrary(); return true }
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let menu = NSMenu()
+        let item = NSMenuItem(title: "프로그램 보관함 보기", action: #selector(showLibraryMenu(_:)), keyEquivalent: "")
+        item.target = self
+        menu.addItem(item)
+        return menu
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let model else { return .terminateNow }
         if model.terminatingForUpdate { return .terminateNow }
         if model.updating {
+            showLibrary()
             let alert = NSAlert(); alert.messageText = "업데이트를 준비하는 중입니다"; alert.informativeText = "내려받기와 검증이 끝난 뒤 앱을 종료해 주세요."; alert.runModal()
             return .terminateCancel
         }
         if let task = model.task {
+            showLibrary()
             let alert = NSAlert(); alert.messageText = "진행 중인 작업이 있습니다"; alert.informativeText = "‘\(task.name)’ 작업이 끝나지 않았습니다. " + task.quitHint; alert.runModal()
             return .terminateCancel
         }
         guard model.session.busy else { return .terminateNow }
+        // With sessions running the window comes back, so the confirmation and then the waiting state are visible.
+        showLibrary()
         if model.session.allStopping { waitingToQuit = true; return .terminateLater }
-        let alert = NSAlert(); alert.messageText = "실행 중인 세션을 종료하고 앱을 닫을까요?"
-        alert.informativeText = "열려 있는 작업이나 게임을 먼저 저장해 주세요. 실행 중인 프로그램이 모두 종료된 뒤 앱을 닫습니다."
-        if model.session.sessions.values.contains(where: \.migrating) {
-            alert.informativeText += "\n\n지금은 앱 업데이트 후 Wine 환경을 새 버전에 맞추는 중입니다. 지금 종료하면 이 업데이트가 중단되며, 다음 실행 때 다시 시도하거나 업데이트 전 상태로 복원할 수 있습니다."
-        }
-        alert.addButton(withTitle: "세션 종료 후 앱 닫기"); alert.addButton(withTitle: "취소")
+        let alert = NSAlert(); alert.messageText = QuitSummary.title
+        alert.informativeText = QuitSummary.text(sessions: model.snapshots(accurate: true), place: model.place(prefix:),
+                                                 migrating: model.session.sessions.values.contains(where: \.migrating))
+        alert.addButton(withTitle: QuitSummary.confirmButton); alert.addButton(withTitle: "취소")
         guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
         waitingToQuit = true; model.session.stopAll(); return .terminateLater
     }

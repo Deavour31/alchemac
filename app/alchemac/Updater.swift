@@ -452,7 +452,8 @@ enum Updater {
     static let helperScript = """
     #!/bin/sh
     # Alchemac update helper. Arguments: pid app staging backup result target [--no-open]. Paths are never part of this text.
-    # `result` receives target=<build> and outcome=installed|restored|not-started for the next launch to report.
+    # `result` receives target=<build> and outcome=installed|restored|restore-failed|not-started for the next launch to report.
+    # "restored" means the previous app is back at its place; "restore-failed" means it is still at the backup path.
     pid="$1"; app="$2"; staging="$3"; backup="$4"; result="$5"; target="$6"; mode="$7"
     reopen() { [ "$mode" = "--no-open" ] || /usr/bin/open "$1"; }
     finish() { printf 'target=%s\\noutcome=%s\\n' "$target" "$1" > "$result.tmp" && /bin/mv -f "$result.tmp" "$result"; }
@@ -465,9 +466,13 @@ enum Updater {
     [ -d "$staging" ] || { finish not-started; reopen "$app"; exit 1; }
     if ! /bin/mv "$app" "$backup"; then finish not-started; reopen "$app"; exit 1; fi
     if ! /bin/mv "$staging" "$app"; then
-      /bin/mv "$backup" "$app"
-      finish restored
-      reopen "$app"
+      if /bin/mv "$backup" "$app"; then
+        finish restored
+        reopen "$app"
+      else
+        finish restore-failed
+        [ "$mode" = "--no-open" ] || { [ -e "$backup" ] && /usr/bin/open -R "$backup"; }
+      fi
       exit 1
     fi
     finish installed
@@ -508,16 +513,16 @@ enum Updater {
     }
 
     /// Starts the helper that swaps the apps once this process has exited. The caller terminates the app afterwards.
-    /// `waitFor`/`open` exist for tests: the pid to wait for, and false to skip the final `open`.
+    /// `waitFor`/`open`/`script` exist for tests: the pid to wait for, false to skip the final `open`, and a script with `/bin/mv` replaced.
     static func installAndRelaunch(staging: URL, app: URL, oldVersion: String, targetBuild: Int, updates: URL = updatesFolder,
-                                   waitFor pid: Int32 = getpid(), open: Bool = true, wait: Bool = false) throws {
+                                   waitFor pid: Int32 = getpid(), open: Bool = true, wait: Bool = false, script text: String = helperScript) throws {
         let fm = FileManager.default
         do {
             try fm.createDirectory(at: updates.appendingPathComponent("previous", isDirectory: true), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             let script = updates.appendingPathComponent("install-helper.sh")
             try? fm.removeItem(at: script)
             try? fm.removeItem(at: updates.appendingPathComponent("last-install.txt"))
-            try Data(helperScript.utf8).write(to: script)
+            try Data(text.utf8).write(to: script)
             try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -533,10 +538,11 @@ enum Updater {
 
     /// Old app copies go to the Trash; the update's own download folders for builds up to the running one and stale
     /// staging copies beside the app are removed. For a background queue.
-    static func cleanup(app: URL = Bundle.main.bundleURL, currentBuild: Int = AlchemacRuntime.appBuild, updates: URL = updatesFolder) {
+    /// `trashPrevious` is false right after a failed restore: the previous app in `previous/` may be the only copy the user has.
+    static func cleanup(app: URL = Bundle.main.bundleURL, currentBuild: Int = AlchemacRuntime.appBuild, updates: URL = updatesFolder, trashPrevious: Bool = true) {
         let fm = FileManager.default
         let previous = updates.appendingPathComponent("previous", isDirectory: true)
-        for name in StartupCleanup.names(previous) where name.hasSuffix(".app") {
+        for name in StartupCleanup.names(previous) where trashPrevious && name.hasSuffix(".app") {
             let url = previous.appendingPathComponent(name, isDirectory: true)
             guard StartupCleanup.isPlainDirectory(url) else { continue }
             do { try fm.trashItem(at: url, resultingItemURL: nil) } catch { log("could not trash \(name): \(error.localizedDescription)") }

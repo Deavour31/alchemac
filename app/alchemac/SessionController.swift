@@ -254,6 +254,15 @@ enum PrefixMigration {
     }
 }
 
+/// The most recent run of a registered program that failed, until it runs again successfully or the user dismisses it.
+struct RunFailure: Equatable {
+    let date: Date
+    let logs: [URL]
+    let prefix: URL?
+    /// The status text the failure produced.
+    let summary: String
+}
+
 /// Programs in different Wine prefixes run side by side. standalone-run allows one
 /// supervisor per prefix, so sessions are keyed by prefix and a second program in a
 /// busy prefix is refused here with a clear message rather than by exit 75.
@@ -265,6 +274,11 @@ final class SessionController: ObservableObject {
     @Published private(set) var lastProblemLogs: [URL] = []
     /// The Wine environment of that run when its failure points at the environment itself.
     @Published private(set) var lastProblemPrefix: URL?
+    /// Per registered program (by launcher ID): its most recent failed run. Cleared when the program starts again or on `dismissFailure`.
+    @Published private(set) var failures: [String: RunFailure] = [:]
+    func dismissFailure(_ id: String) { failures[id] = nil }
+    /// Runs when a run failed or ended at once, with the session that did (also for sessions without a registered program).
+    var failed: ((Session, RunFailure) -> Void)?
     /// Runs when the last session has ended.
     var finished: (() -> Void)?
     private let runtime: URL
@@ -392,6 +406,7 @@ final class SessionController: ObservableObject {
             session.migrationMessage = "\(title) 실행 준비 중 · 앱 업데이트 후 첫 실행이라 Wine 환경을 새 버전에 맞추고 있습니다. 몇 분 걸릴 수 있으니 끝날 때까지 종료하지 마세요."
         }
         lastProblemLogs = []; lastProblemPrefix = nil
+        if let id { failures[id] = nil }
         sessions[prefix] = session
         message = migrating ? session.migrationMessage : running
         if resetCopy { message += "\n" + RuntimeCopy.resetNotice }
@@ -417,6 +432,7 @@ final class SessionController: ObservableObject {
         for session in sessions.values where session.migrationRuntime != nil {
             if session.migrating { pending = true; continue }
             if let text = LaunchDiagnostics.settledMessage(current: message, migration: session.migrationMessage, running: session.runningMessage) { message = text }
+            objectWillChange.send()
             session.migrationRuntime = nil
         }
         return pending
@@ -444,6 +460,9 @@ final class SessionController: ObservableObject {
             lastProblemLogs = [session.runtimeLog, session.outerLog].compactMap { $0 }
             let logText = LaunchDiagnostics.tail(session.outerLog) + "\n" + (session.runtimeLog.map { LaunchDiagnostics.tail($0) } ?? "")
             lastProblemPrefix = LaunchDiagnostics.wantsEnvironmentFolder(logText) ? URL(fileURLWithPath: prefix, isDirectory: true) : nil
+            let failure = RunFailure(date: Date(), logs: lastProblemLogs, prefix: lastProblemPrefix, summary: message)
+            if let id = session.launcherID { failures[id] = failure }
+            failed?(session, failure)
         }
         session.after?()
         if sessions.isEmpty { finished?() }

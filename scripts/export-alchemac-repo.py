@@ -34,7 +34,7 @@ FILES = {
     'tools/runtime/patch-mtld3d-d3d9.py': 'tools/runtime/patch-mtld3d-d3d9.py',
     'tools/runtime/patch-wine-unix-lib.py': 'tools/runtime/patch-wine-unix-lib.py',
 }
-APP_SOURCES = ['main.swift', 'App.swift', 'Runtime.swift', 'SessionController.swift', 'Profile.swift',
+APP_SOURCES = ['main.swift', 'App.swift', 'Runtime.swift', 'SessionController.swift', 'ProgramState.swift', 'Profile.swift',
                'InputSource.swift', 'Addon.swift', 'ExeIcon.swift', 'Maintenance.swift', 'Updater.swift', 'prefix-profile.c', 'session-attach', 'README.md', 'LICENSE']
 
 HADRON_README = f"""# Hadron changes
