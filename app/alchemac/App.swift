@@ -1,5 +1,7 @@
 import AppKit
+import Combine
 import SwiftUI
+import UniformTypeIdentifiers
 
 @MainActor
 final class LibraryModel: ObservableObject {
@@ -28,6 +30,18 @@ final class LibraryModel: ObservableObject {
     }
     @Published var task: BusyTask?
     var importing: Bool { task != nil }
+    /// The library is held by a task or an update: commands that change things wait.
+    var locked: Bool { importing || updating }
+    /// Why, in plain words (same wording as the program rules); nil when idle.
+    var lockReason: String? { updating ? "업데이트를 준비하는 중입니다" : task.map { "‘\($0.name)’ 작업이 끝난 뒤 다시 시도해 주세요" } }
+    /// The name of what holds the library, for a refused drop.
+    var busyName: String? { updating ? "업데이트" : task?.name }
+    /// Set by the app delegate: open the Settings / Management window (the latter on a tab).
+    var openSettings: () -> Void = {}
+    var openManagement: (ManagementTab) -> Void = { _ in }
+    @Published var managementTab: ManagementTab = .environments
+    /// The EXE being dragged over the window (drives the overlay).
+    @Published var dropPreview: URL?
     @Published var importMessage = ""
     private func begin(_ task: BusyTask, _ message: String) { self.task = task; importMessage = message }
     /// An update is being downloaded, applied or verified: the library is locked like during an import.
@@ -36,6 +50,8 @@ final class LibraryModel: ObservableObject {
     /// Set right before the app quits for the update helper, so nothing holds the quit back.
     var terminatingForUpdate = false
     @Published private(set) var checkingForUpdate = false
+    /// The last update check's result (this run), or just its time from an earlier run.
+    @Published var lastUpdateCheck: UpdateCheckStatus? = (UserDefaults.standard.object(forKey: Updater.lastCheckKey) as? Date).map { UpdateCheckStatus(date: $0, outcome: .unknown) }
     @Published var automaticUpdateCheck: Bool = UserDefaults.standard.bool(forKey: Updater.automaticKey) {
         didSet { UserDefaults.standard.set(automaticUpdateCheck, forKey: Updater.automaticKey) }
     }
@@ -159,6 +175,7 @@ final class LibraryModel: ObservableObject {
     @Published var addons: [Addon] = []
     func refreshAddons() { addons = store.installedAddons() }
     func installAddon() {
+        guard !locked else { return }
         let panel = NSOpenPanel()
         panel.title = "애드온(.alchemacaddon) 선택"
         panel.message = "애드온은 프로그램별 실행 설정만 담고 있으며 코드를 실행하지 않습니다."
@@ -184,6 +201,7 @@ final class LibraryModel: ObservableObject {
         } catch { self.error(error) }
     }
     func removeAddon(_ addon: Addon) {
+        guard !locked else { return }
         let users = registry.launchers.filter { $0.addon == addon.id }
         let alert = NSAlert(); alert.messageText = "‘\(addon.name)’ 애드온을 제거할까요?"
         alert.informativeText = users.isEmpty
@@ -199,6 +217,7 @@ final class LibraryModel: ObservableObject {
     func revealEnvironment(_ environment: String?) { NSWorkspace.shared.open(store.prefix(environment: environment)) }
     /// Moves a dedicated environment no registered program uses to the Trash.
     func deleteEnvironment(_ name: String) {
+        guard !locked else { return }
         if let user = registry.launchers.first(where: { !$0.privatePrefix && $0.environment == name }) {
             self.error(AlchemacError.message("이 환경을 사용하는 프로그램이 있습니다: ‘\(user.name)’. 그 프로그램을 먼저 삭제하거나 목록에서 제거해 주세요.")); return
         }
@@ -301,6 +320,7 @@ final class LibraryModel: ObservableObject {
     }
     /// At launch (`startup`) only speaks up when something is left; the menu item also says when nothing is.
     func checkOrphans(startup: Bool) {
+        guard startup || !locked else { return }
         let found = orphanedEnvironments()
         if !found.isEmpty { offerOrphanStop(found, startup: startup); return }
         guard !startup else { return }
@@ -378,19 +398,24 @@ final class LibraryModel: ObservableObject {
             defer { self.checkingForUpdate = false }
             do {
                 let found = try await Updater.checkForUpdate(currentBuild: build)
-                UserDefaults.standard.set(Date(), forKey: Updater.lastCheckKey)
+                let now = Date()
+                UserDefaults.standard.set(now, forKey: Updater.lastCheckKey)
                 switch found {
                 case .available(let manifest):
+                    self.lastUpdateCheck = UpdateCheckStatus(date: now, outcome: .available(manifest.version))
                     if self.presentNow, manual || !self.session.busy { _ = self.offerUpdate(manifest) }
                     else { self.addResult(.updateAvailable(manifest)) }
                 case .needsSystem(let version):
+                    self.lastUpdateCheck = UpdateCheckStatus(date: now, outcome: .needsSystem(version))
                     // The automatic check stays silent: nothing the user can do about it.
                     if manual { self.notify("업데이트를 설치할 수 없습니다", "이 업데이트는 macOS \(version) 이상이 필요합니다. 현재 이 Mac에서는 설치할 수 없습니다.") }
                 case .upToDate:
+                    self.lastUpdateCheck = UpdateCheckStatus(date: now, outcome: .upToDate)
                     if manual { self.notify("최신 버전입니다", "현재 버전은 v\(AlchemacRuntime.appVersion)입니다. 가장 최신 버전입니다.") }
                 }
             } catch {
                 fputs("Alchemac: update check failed: \(error.localizedDescription)\n", stderr)
+                self.lastUpdateCheck = UpdateCheckStatus(date: Date(), outcome: .failed(error.localizedDescription))
                 if manual { self.notify("업데이트를 확인하지 못했습니다", error.localizedDescription, style: .warning) }
             }
         }
@@ -424,7 +449,7 @@ final class LibraryModel: ObservableObject {
             case "not-started": detail = "업데이트를 시작하지 못해 이전 버전을 그대로 유지했습니다."
             default: detail = "업데이트가 적용되지 않아 이전 버전이 계속 실행되고 있습니다."
             }
-            notify("업데이트를 설치하지 못했습니다", detail + "\n현재 버전은 v\(version)입니다. 잠시 뒤 ‘관리’ 메뉴의 ‘업데이트 확인…’으로 다시 시도해 주세요.", style: .warning)
+            notify("업데이트를 설치하지 못했습니다", detail + "\n현재 버전은 v\(version)입니다. 잠시 뒤 ‘Alchemac’ 메뉴의 ‘업데이트 확인…’으로 다시 시도해 주세요.", style: .warning)
         }
     }
 
@@ -489,10 +514,64 @@ final class LibraryModel: ObservableObject {
         }
     }
 
+    // MARK: Dropped files, version info
+
+    /// While a file is dragged over the window: the overlay shows for one acceptable EXE only.
+    func dragTargeted(_ on: Bool) {
+        guard on else { dropPreview = nil; return }
+        let urls = (NSPasteboard(name: .drag).readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+        if !showingResults, case .exe(let file) = DropInput.classify(urls: urls, isDirectory: Self.isFolder, busy: busyName) { dropPreview = file } else { dropPreview = nil }
+    }
+    private static func isFolder(_ url: URL) -> Bool { (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+    func receiveDrop(_ providers: [NSItemProvider]) -> Bool {
+        dropPreview = nil
+        var urls: [URL] = []
+        let group = DispatchGroup()
+        for provider in providers where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            group.enter()
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in DispatchQueue.main.async { if let url { urls.append(url) }; group.leave() } }
+        }
+        group.notify(queue: .main) { [weak self] in self?.handleDrop(urls) }
+        return true
+    }
+    private func handleDrop(_ urls: [URL]) {
+        guard !showingResults else { return }
+        switch DropInput.classify(urls: urls, isDirectory: Self.isFolder, busy: busyName) {
+        case .rejected(let text):
+            let alert = NSAlert(); alert.alertStyle = .warning
+            alert.messageText = "놓은 파일을 사용할 수 없습니다"; alert.informativeText = text
+            alert.addButton(withTitle: "확인"); alert.runModal()
+        case .exe(let file):
+            let alert = NSAlert()
+            alert.messageText = DropInput.choiceTitle(file.lastPathComponent)
+            alert.informativeText = DropInput.choiceText + "\n\n" + (file.path as NSString).abbreviatingWithTildeInPath
+            alert.addButton(withTitle: "설치 파일 실행…"); alert.addButton(withTitle: "프로그램 등록…"); alert.addButton(withTitle: "취소")
+            // Return must not pick install: no default button; Escape cancels.
+            alert.buttons[0].keyEquivalent = ""; alert.buttons[1].keyEquivalent = ""; alert.buttons[2].keyEquivalent = "\u{1b}"
+            switch alert.runModal() {
+            case .alertFirstButtonReturn: install(file: file)
+            case .alertSecondButtonReturn: add(file: file)
+            default: break
+            }
+        }
+    }
+    /// For bug reports: versions only, no paths or settings.
+    func copyVersionInfo() {
+        let text = "Alchemac \(AlchemacRuntime.versionLine)\n런타임 \(AlchemacRuntime.buildID)\nmacOS \(ProcessInfo.processInfo.operatingSystemVersionString)"
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
+        session.message = "버전 정보를 복사했습니다."
+    }
+    /// What the Management window shows for one Wine environment (nil = shared).
+    func environmentRow(_ environment: String?) -> EnvironmentRow {
+        EnvironmentRow(programs: registry.launchers.filter { !$0.privatePrefix && $0.environment == environment }.count,
+                       running: session.session(in: store.prefix(environment: environment)) != nil, shared: environment == nil)
+    }
+
     // MARK: Backups
 
     /// "환경 백업 정리…": keeps the newest snapshot of each environment and moves the others to the Trash.
     func manageBackups() {
+        guard !locked else { return }
         let environments = store.knownEnvironments(registry), store = self.store
         begin(.backupCleanup, "환경 백업을 찾는 중입니다…")
         DispatchQueue.global(qos: .userInitiated).async {
@@ -591,7 +670,9 @@ final class LibraryModel: ObservableObject {
         guard let current = session.session(in: prefix), current === running else { session.message = "그 사이 이 Wine 환경의 프로그램이 이미 끝났습니다."; return }
         session.stop(current)
     }
+    /// "프로그램 등록": the file panel, then `add(file:)`.
     func add() {
+        guard !locked else { return }
         let panel = NSOpenPanel()
         panel.title = "등록할 Windows 프로그램(.exe) 선택"
         panel.message = "설치한 프로그램은 해당 Wine 환경의 Program Files에서 고르세요. 그 밖의 EXE는 폴더를 보관함에 복사합니다. 설치된 애드온이 있는 프로그램은 그 설정으로 등록됩니다."
@@ -599,6 +680,11 @@ final class LibraryModel: ObservableObject {
         let programs = store.sharedPrefix.appendingPathComponent("drive_c/Program Files", isDirectory: true)
         if FileManager.default.fileExists(atPath: programs.path) { panel.directoryURL = programs }
         guard panel.runModal() == .OK, let file = panel.url else { return }
+        add(file: file)
+    }
+    /// The register flow after the EXE is known; the file panel and a dropped file share it.
+    func add(file: URL) {
+        guard !locked else { return }
         // An EXE inside a Wine environment belongs to it; a copied folder can run in any.
         var choice = EnvironmentChoice(name: nil, fresh: false, retina: false)
         let plan = store.copyPlan(for: file)
@@ -650,12 +736,19 @@ final class LibraryModel: ObservableObject {
             }
         }
     }
+    /// "설치 파일 실행": the file panel, then `install(file:)`.
     func install() {
+        guard !locked else { return }
         let panel = NSOpenPanel()
         panel.title = "Windows 설치 파일(.exe) 선택"
         panel.message = "다음 단계에서 설치할 Wine 환경을 선택합니다. 설치 파일은 수정하지 않습니다."
         panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let file = panel.url else { return }
+        install(file: file)
+    }
+    /// The install flow after the EXE is known; the file panel and a dropped file share it.
+    func install(file: URL) {
+        guard !locked else { return }
         guard let choice = chooseEnvironment(for: file, purpose: "어느 Wine 환경에 설치할까요?") else { return }
         prepare(choice) { [weak self] in
             guard let self else { return }
@@ -1105,11 +1198,6 @@ struct LibraryView: View {
             HStack {
                 Text("등록된 프로그램").font(.headline)
                 Spacer()
-                if !model.results.isEmpty {
-                    Button("확인할 결과 \(model.results.count)개…") { model.showingResults = true }
-                }
-                Button(action: model.install) { Label("설치 파일 실행", systemImage: "shippingbox") }.disabled(locked)
-                Button(action: model.add) { Label("프로그램 등록", systemImage: "plus") }.disabled(locked)
             }
             List(selection: $model.registry.selectedID) {
                 ForEach(model.registry.launchers) { launcher in row(launcher) }
@@ -1125,61 +1213,27 @@ struct LibraryView: View {
                     }
                 }
             }.disabled(locked)
+            .overlay {
+                if let file = model.dropPreview {
+                    VStack(spacing: 6) {
+                        Image(systemName: "arrow.down.doc.fill").font(.largeTitle).foregroundStyle(Color.teal)
+                        Text(DropInput.overlayTitle(file.lastPathComponent)).font(.headline).multilineTextAlignment(.center)
+                        Text(DropInput.overlayNote).font(.caption).foregroundStyle(.secondary)
+                    }
+                    .padding(20).frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(.regularMaterial)
+                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.teal, style: StrokeStyle(lineWidth: 2, dash: [6])))
+                    .allowsHitTesting(false)
+                    .accessibilityElement(children: .ignore).accessibilityLabel(DropInput.overlayTitle(file.lastPathComponent) + ". " + DropInput.overlayNote)
+                }
+            }
             .onChange(of: model.registry.selectedID) { _, _ in model.save() }
             unregisteredSessions
             HStack {
                 let selected = model.selected
                 let can = selected.map { model.availability(for: $0) }
                 Button("프로그램 폴더") { if let selected { model.revealGame(id: selected.id) } }.disabled(selected == nil)
-                Menu("관리") {
-                    Button("이름 변경") { model.rename() }.disabled(!(can?.canRename ?? false)).help(can?.modifyReason ?? "")
-                    Button("목록에서 제거") { model.remove() }.disabled(!(can?.canRemove ?? false)).help(can?.modifyReason ?? "")
-                    Button("프로그램 삭제…") { model.deleteProgram() }.disabled(!(can?.canDelete ?? false)).help(can?.deleteReason ?? "")
-                    Button("같은 Wine 환경에서 다른 EXE 실행…") { model.runTool() }.disabled(!(can?.canRunTool ?? false)).help(can?.toolReason ?? "")
-                    if let selected, let can {
-                        Divider()
-                        let scope = selected.privatePrefix ? "이 프로그램 Wine 환경의" : "이 Wine 환경의"
-                        Button(model.retinaOn(selected) ? scope + " 선명한 화면 끄기" : scope + " 선명한 화면(Retina) 켜기") { model.toggleRetina() }
-                            .disabled(!can.canToggleRetina).help(can.retinaReason ?? "")
-                        Button(selected.scaled ? "크기 보정 끄기" : "크기 보정 켜기 (작게 보일 때)") { model.toggleScaled() }.disabled(!can.canToggleScaled)
-                    }
-                    Divider()
-                    Button("최근 오류 로그 보기", action: model.revealProblemLog).disabled(session.lastProblemLogs.isEmpty)
-                    Button("진단 로그 열기", action: model.revealLogs)
-                    Button("오픈소스 라이선스") { NSWorkspace.shared.open(AlchemacRuntime.licenses) }
-                    Divider()
-                    Button(model.checkingForUpdate ? "업데이트 확인 중…" : "업데이트 확인…") { model.checkForUpdate(manual: true) }.disabled(locked || model.checkingForUpdate)
-                    Toggle("업데이트 자동 확인", isOn: $model.automaticUpdateCheck)
-                }.fixedSize()
-                Menu("애드온") {
-                    ForEach(model.addons) { addon in
-                        Menu(addon.name + " " + addon.version) {
-                            if let summary = addon.summary { Text(summary) }
-                            Button("제거…") { model.removeAddon(addon) }.disabled(locked)
-                        }
-                    }
-                    if !model.addons.isEmpty { Divider() }
-                    Button("애드온 설치…", action: model.installAddon).disabled(locked)
-                }.fixedSize()
-                Menu("Wine 환경") {
-                    ForEach(model.environmentNames, id: \.self) { key in
-                        let environment: String? = key.isEmpty ? nil : key
-                        let busy = session.session(in: model.store.prefix(environment: environment)) != nil
-                        let sharp = model.retinaOn(environment: environment)
-                        Menu(model.place(environment) + (sharp ? " · 선명한 화면" : "")) {
-                            Button(sharp ? "선명한 화면 끄기" : "선명한 화면(Retina) 켜기") { model.toggleRetina(environment: environment) }
-                                .disabled(locked || busy)
-                            Button("폴더 열기") { model.revealEnvironment(environment) }
-                            if let name = environment {
-                                Divider()
-                                Button("환경 삭제…") { model.deleteEnvironment(name) }.disabled(locked || busy)
-                            }
-                        }
-                    }
-                    Divider()
-                    Button("남은 세션 확인…") { model.checkOrphans(startup: false) }.disabled(locked)
-                    Button("환경 백업 정리…", action: model.manageBackups).disabled(locked)
-                }.fixedSize()
+                Button("관리…") { model.openManagement(.environments) }.help("Wine 환경과 애드온을 관리합니다")
                 Spacer()
                 if let selected, let can {
                     if can.environmentSession != nil {
@@ -1214,6 +1268,7 @@ struct LibraryView: View {
                 .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
         }
         .padding(26).frame(minWidth: 590, minHeight: 480)
+        .onDrop(of: [UTType.fileURL], isTargeted: Binding(get: { model.dropPreview != nil }, set: { model.dragTargeted($0) })) { providers in model.receiveDrop(providers) }
         .sheet(isPresented: $model.showingResults) { ResultsView(model: model) { model.showingResults = false } }
         .onChange(of: model.results.isEmpty) { _, empty in if empty { model.showingResults = false } }
     }
@@ -1269,11 +1324,134 @@ struct ResultsView: View {
     }
 }
 
+extension AlchemacRuntime {
+    /// "0.5.16 (39)"
+    static var versionLine: String { "\(appVersion) (\(appBuild))" }
+}
+
+enum ManagementTab: Int { case environments, addons }
+
+/// Settings window (⌘,): update, maintenance, version.
+struct SettingsView: View {
+    @ObservedObject var model: LibraryModel
+    @ObservedObject var session: SessionController
+
+    private var updateLine: String {
+        guard let status = model.lastUpdateCheck else { return UpdateCheckStatus.never }
+        return status.line(when: LibraryView.time(status.date))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("업데이트").font(.headline)
+                Toggle("앱을 열 때 업데이트 자동 확인", isOn: $model.automaticUpdateCheck)
+                Text("마지막 확인 후 24시간이 지났을 때 확인합니다.").font(.caption).foregroundStyle(.secondary)
+                HStack(spacing: 12) {
+                    Button(model.checkingForUpdate ? "확인 중…" : "업데이트 확인") { model.checkForUpdate(manual: true) }
+                        .disabled(model.locked || model.checkingForUpdate).help(model.lockReason ?? "")
+                    Text(updateLine).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
+                }
+                Text("업데이트 확인 시 GitHub에서 릴리스 정보와 검증용 서명을 받습니다.").font(.caption).foregroundStyle(.secondary)
+            }
+            Divider()
+            VStack(alignment: .leading, spacing: 8) {
+                Text("유지 관리").font(.headline)
+                HStack(spacing: 12) {
+                    Button("환경 백업 정리…") { model.manageBackups() }.disabled(model.locked).help(model.lockReason ?? "")
+                    Button("이전 실행에서 남은 프로그램 확인…") { model.checkOrphans(startup: false) }.disabled(model.locked).help(model.lockReason ?? "")
+                }
+                Text("앱을 열 때도 자동으로 확인합니다.").font(.caption).foregroundStyle(.secondary)
+            }
+            Divider()
+            HStack {
+                Text("Alchemac \(AlchemacRuntime.versionLine) · 런타임 \(AlchemacRuntime.buildID)")
+                    .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                Spacer()
+                Button("버전 정보 복사") { model.copyVersionInfo() }
+            }
+        }
+        .padding(24).frame(width: 520)
+    }
+}
+
+/// "Wine 환경 및 애드온 관리": Wine environments and add-ons in one place.
+struct ManagementView: View {
+    @ObservedObject var model: LibraryModel
+    @ObservedObject var session: SessionController
+
+    @ViewBuilder private func environmentRow(_ key: String) -> some View {
+        let environment: String? = key.isEmpty ? nil : key
+        let info = model.environmentRow(environment)
+        let sharp = model.retinaOn(environment: environment)
+        let lock = model.lockReason
+        let deleteReason = info.deleteReason(lock: lock)
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(model.place(environment)).font(.headline)
+                HStack(spacing: 8) {
+                    Text(info.programsText)
+                    if info.running { Text("실행 중").foregroundStyle(Color.teal) }
+                    Text(sharp ? "선명한 화면 켜짐" : "선명한 화면 꺼짐")
+                }.font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("폴더 열기") { model.revealEnvironment(environment) }
+            Button(sharp ? "선명한 화면 끄기" : "선명한 화면(Retina) 켜기") { model.toggleRetina(environment: environment) }
+                .disabled(model.locked || info.running)
+                .help(model.lockReason ?? (info.running ? ProgramAvailability.retinaBusyReason : "선명한 화면(Retina)은 이 Wine 환경의 모든 프로그램에 적용됩니다"))
+            if let name = environment {
+                Button("환경 삭제…") { model.deleteEnvironment(name) }.disabled(deleteReason != nil).help(deleteReason ?? "")
+            } else {
+                Button("환경 삭제…") {}.disabled(true).help(deleteReason ?? "")
+            }
+        }.padding(.vertical, 6)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Picker("", selection: $model.managementTab) {
+                Text("Wine 환경").tag(ManagementTab.environments)
+                Text("애드온").tag(ManagementTab.addons)
+            }.pickerStyle(.segmented).labelsHidden().accessibilityLabel("관리할 항목")
+            if model.managementTab == .environments {
+                List { ForEach(model.environmentNames, id: \.self) { environmentRow($0) } }.listStyle(.inset)
+                HStack(spacing: 12) {
+                    Button("이전 실행에서 남은 프로그램 확인…") { model.checkOrphans(startup: false) }
+                    Button("환경 백업 정리…") { model.manageBackups() }
+                    Spacer()
+                }.disabled(model.locked).help(model.lockReason ?? "")
+            } else {
+                List {
+                    ForEach(model.addons) { addon in
+                        HStack(spacing: 10) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(addon.name + " " + addon.version).font(.headline)
+                                if let summary = addon.summary { Text(summary).font(.caption).foregroundStyle(.secondary).lineLimit(3) }
+                            }
+                            Spacer()
+                            Button("제거…") { model.removeAddon(addon) }.disabled(model.locked).help(model.lockReason ?? "")
+                        }.padding(.vertical, 6)
+                    }
+                }.listStyle(.inset)
+                .overlay { if model.addons.isEmpty { Text("설치된 애드온이 없습니다").foregroundStyle(.secondary) } }
+                HStack { Button("애드온 설치…") { model.installAddon() }.disabled(model.locked).help(model.lockReason ?? ""); Spacer() }
+            }
+        }
+        .padding(20).frame(minWidth: 620, minHeight: 360)
+    }
+}
+
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSToolbarDelegate, NSMenuItemValidation {
     var window: NSWindow?
+    var settingsWindow: NSWindow?
+    var managementWindow: NSWindow?
     var model: LibraryModel?
     var waitingToQuit = false
+    private var changes: AnyCancellable?
+    private var registerItem: NSToolbarItem?, installItem: NSToolbarItem?, resultsItem: NSToolbarItem?
+    private static let registerID = NSToolbarItem.Identifier("alchemac.register"), installID = NSToolbarItem.Identifier("alchemac.install"), resultsID = NSToolbarItem.Identifier("alchemac.results")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         do {
@@ -1290,6 +1468,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                   styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
             window.title = "Alchemac v" + AlchemacRuntime.appVersion; window.delegate = self; window.isReleasedWhenClosed = false
             window.contentView = NSHostingView(rootView: LibraryView(model: model, session: model.session))
+            let toolbar = NSToolbar(identifier: "alchemac.library"); toolbar.delegate = self
+            toolbar.displayMode = .iconAndLabel; toolbar.allowsUserCustomization = false
+            window.toolbar = toolbar
+            model.openSettings = { [weak self] in self?.showSettings() }
+            model.openManagement = { [weak self] tab in self?.showManagement(tab) }
+            changes = model.objectWillChange.receive(on: DispatchQueue.main).sink { [weak self] _ in MainActor.assumeIsolated { self?.refreshChrome() } }
+            refreshChrome()
             window.minSize = NSSize(width: 600, height: 510)
             window.center(); window.makeKeyAndOrderFront(nil); self.window = window
             NSApp.activate(ignoringOtherApps: true)
@@ -1313,6 +1498,126 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.makeKeyAndOrderFront(nil)
     }
     @objc func showLibraryMenu(_ sender: Any?) { showLibrary() }
+    @objc func showResultsMenu(_ sender: Any?) { showLibrary(); model?.showingResults = true }
+
+    // MARK: Toolbar, Dock badge
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [Self.registerID, Self.installID, .flexibleSpace, Self.resultsID] }
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { toolbarDefaultItemIdentifiers(toolbar) }
+    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier identifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        let item = NSToolbarItem(itemIdentifier: identifier)
+        item.target = self; item.autovalidates = false
+        switch identifier {
+        case Self.registerID:
+            item.label = "프로그램 등록"; item.toolTip = "이미 설치했거나 압축을 푼 프로그램을 등록합니다"
+            item.image = NSImage(systemSymbolName: "plus.app", accessibilityDescription: "프로그램 등록"); item.action = #selector(menuRegister(_:)); registerItem = item
+        case Self.installID:
+            item.label = "설치 파일 실행"; item.toolTip = "Windows 설치 파일(.exe)을 실행해 설치합니다"
+            item.image = NSImage(systemSymbolName: "square.and.arrow.down", accessibilityDescription: "설치 파일 실행"); item.action = #selector(menuInstall(_:)); installItem = item
+        case Self.resultsID:
+            item.label = "확인할 결과"; item.toolTip = "창이 보이지 않을 때 생긴 일을 확인합니다"
+            item.image = NSImage(systemSymbolName: "tray.full", accessibilityDescription: "확인할 결과"); item.action = #selector(showResultsMenu(_:)); resultsItem = item
+        default: return nil
+        }
+        refreshChrome()
+        return item
+    }
+    /// Toolbar state and the Dock badge follow the model (results, library lock).
+    func refreshChrome() {
+        guard let model else { return }
+        registerItem?.isEnabled = !model.locked; installItem?.isEnabled = !model.locked
+        if let resultsItem {
+            resultsItem.isHidden = model.results.isEmpty
+            resultsItem.label = "확인할 결과 \(model.results.count)"
+        }
+        NSApp.dockTile.badgeLabel = model.results.isEmpty ? nil : "\(model.results.count)"
+    }
+
+    // MARK: Settings and Management windows (one each; closing only closes)
+
+    private func auxiliaryWindow(title: String, content: NSView, resizable: Bool, size: NSSize? = nil) -> NSWindow {
+        let window = NSWindow(contentRect: NSRect(origin: .zero, size: size ?? content.fittingSize),
+                              styleMask: resizable ? [.titled, .closable, .miniaturizable, .resizable] : [.titled, .closable], backing: .buffered, defer: false)
+        window.title = title; window.isReleasedWhenClosed = false; window.delegate = self
+        window.contentView = content
+        if !resizable { window.setContentSize(content.fittingSize) }
+        window.center()
+        return window
+    }
+    func showSettings() {
+        guard let model else { return }
+        if settingsWindow == nil {
+            settingsWindow = auxiliaryWindow(title: "설정", content: NSHostingView(rootView: SettingsView(model: model, session: model.session)), resizable: false)
+        }
+        NSApp.activate(ignoringOtherApps: true); settingsWindow?.makeKeyAndOrderFront(nil)
+    }
+    func showManagement(_ tab: ManagementTab) {
+        guard let model else { return }
+        model.managementTab = tab; model.refreshRetina(); model.refreshAddons()
+        if managementWindow == nil {
+            let window = auxiliaryWindow(title: "Wine 환경 및 애드온 관리", content: NSHostingView(rootView: ManagementView(model: model, session: model.session)), resizable: true, size: NSSize(width: 680, height: 440))
+            window.minSize = NSSize(width: 620, height: 360)
+            managementWindow = window
+        }
+        NSApp.activate(ignoringOtherApps: true); managementWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    // MARK: Menu bar commands
+
+    /// The library window is the key window with no sheet: the only time program commands may act on the selected row.
+    private var libraryUsable: Bool { model != nil && window?.isKeyWindow == true && window?.attachedSheet == nil && NSApp.modalWindow == nil }
+    private var target: (launcher: Launcher, can: ProgramAvailability)? {
+        guard libraryUsable, let model, let selected = model.selected else { return nil }
+        return (selected, model.availability(for: selected))
+    }
+    @objc func menuAbout(_ sender: Any?) { NSApp.orderFrontStandardAboutPanel(sender) }
+    @objc func menuSettings(_ sender: Any?) { showSettings() }
+    @objc func menuCheckUpdate(_ sender: Any?) { model?.checkForUpdate(manual: true) }
+    @objc func menuRegister(_ sender: Any?) { model?.add() }
+    @objc func menuInstall(_ sender: Any?) { model?.install() }
+    @objc func menuRun(_ sender: Any?) { model?.start() }
+    @objc func menuRunTool(_ sender: Any?) { model?.runTool() }
+    @objc func menuStopEnvironment(_ sender: Any?) { model?.stop() }
+    @objc func menuReveal(_ sender: Any?) { model?.revealGame() }
+    @objc func menuRename(_ sender: Any?) { model?.rename() }
+    @objc func menuToggleScaled(_ sender: Any?) { model?.toggleScaled() }
+    @objc func menuToggleRetina(_ sender: Any?) { model?.toggleRetina() }
+    @objc func menuRemove(_ sender: Any?) { model?.remove() }
+    @objc func menuDelete(_ sender: Any?) { model?.deleteProgram() }
+    @objc func menuManagement(_ sender: Any?) { showManagement(.environments) }
+    @objc func menuOrphans(_ sender: Any?) { model?.checkOrphans(startup: false) }
+    @objc func menuBackups(_ sender: Any?) { model?.manageBackups() }
+    @objc func menuInstallAddon(_ sender: Any?) { model?.installAddon() }
+    @objc func menuManageAddons(_ sender: Any?) { showManagement(.addons) }
+    @objc func menuRecentLog(_ sender: Any?) { model?.revealProblemLog() }
+    @objc func menuLogsFolder(_ sender: Any?) { model?.revealLogs() }
+    @objc func menuCopyVersion(_ sender: Any?) { model?.copyVersionInfo() }
+    @objc func menuLicenses(_ sender: Any?) { NSWorkspace.shared.open(AlchemacRuntime.licenses) }
+
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        guard let model, let action = item.action else { return true }
+        let idle = !model.locked
+        switch action {
+        case #selector(menuCheckUpdate(_:)): return idle && !model.checkingForUpdate
+        case #selector(menuRegister(_:)), #selector(menuInstall(_:)): return libraryUsable && idle
+        case #selector(menuOrphans(_:)), #selector(menuBackups(_:)), #selector(menuInstallAddon(_:)): return idle
+        case #selector(menuRecentLog(_:)): return !model.session.lastProblemLogs.isEmpty
+        case #selector(menuRun(_:)): return target?.can.canRun ?? false
+        case #selector(menuRunTool(_:)): return target?.can.canRunTool ?? false
+        case #selector(menuStopEnvironment(_:)): return target?.can.canStopEnvironment ?? false
+        case #selector(menuReveal(_:)): return target != nil
+        case #selector(menuRename(_:)): return target?.can.canRename ?? false
+        case #selector(menuRemove(_:)): return target?.can.canRemove ?? false
+        case #selector(menuDelete(_:)): return target?.can.canDelete ?? false
+        case #selector(menuToggleScaled(_:)):
+            if let t = target { item.title = t.launcher.scaled ? "크기 보정 끄기" : "크기 보정 켜기 (작게 보일 때)" }
+            return target?.can.canToggleScaled ?? false
+        case #selector(menuToggleRetina(_:)):
+            if let t = target { item.title = model.retinaOn(t.launcher) ? "선명한 화면(Retina) 끄기" : "선명한 화면(Retina) 켜기" }
+            return target?.can.canToggleRetina ?? false
+        default: return true
+        }
+    }
 
     // Closing the window only closes it: the app stays in the Dock and sessions keep running. Quit with ⌘Q.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -1322,6 +1627,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let item = NSMenuItem(title: "프로그램 보관함 보기", action: #selector(showLibraryMenu(_:)), keyEquivalent: "")
         item.target = self
         menu.addItem(item)
+        if let count = model?.results.count, count > 0 {
+            let results = NSMenuItem(title: "확인할 결과 \(count)개…", action: #selector(showResultsMenu(_:)), keyEquivalent: "")
+            results.target = self
+            menu.addItem(results)
+        }
         return menu
     }
 

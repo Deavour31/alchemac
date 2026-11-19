@@ -396,6 +396,60 @@ index 0000000..8b86384
 +-- 
 +2.54.0 (Apple Git-157)
 +
+diff --git a/patches/fex/0007-CPUID-Fixes-crash-in-CPUID.patch b/patches/fex/0007-CPUID-Fixes-crash-in-CPUID.patch
+new file mode 100644
+index 0000000..bb8b796
+--- /dev/null
++++ b/patches/fex/0007-CPUID-Fixes-crash-in-CPUID.patch
+@@ -0,0 +1,48 @@
++From 9e5b3c0afa9f4334ce899264926182e442fd15ca Mon Sep 17 00:00:00 2001
++From: Ryan Houdek <Sonicadvance1@gmail.com>
++Date: Thu, 5 Nov 2026 20:25:03 -0800
++Subject: [PATCH] CPUID: Fixes crash in CPUID
++
++When affinity changes are in play this can cause a crash because core
++index is larger than the number of cores known about.
++
++Happens on Frame.
++
++(cherry picked from commit b9fc587ac88e098613e33d12b77a8449ca93eabf)
++---
++ FEXCore/Source/Interface/Core/CPUID.cpp | 6 +++---
++ 1 file changed, 3 insertions(+), 3 deletions(-)
++
++diff --git a/FEXCore/Source/Interface/Core/CPUID.cpp b/FEXCore/Source/Interface/Core/CPUID.cpp
++index ddce98d66..a4ff516ec 100644
++--- a/FEXCore/Source/Interface/Core/CPUID.cpp
+++++ b/FEXCore/Source/Interface/Core/CPUID.cpp
++@@ -1133,14 +1133,14 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0004h(uint32_t Leaf) con
++ 
++ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0002h(uint32_t Leaf, uint32_t CPU) const {
++   FEXCore::CPUID::FunctionResults Res {};
++-  auto& Data = PerCPUData[CPU];
+++  auto& Data = PerCPUData[std::min<uint32_t>(CPU, PerCPUData.size() - 1)];
++   memcpy(&Res, Data.ProductName, std::min(strlen(Data.ProductName), sizeof(FEXCore::CPUID::FunctionResults)));
++   return Res;
++ }
++ 
++ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0003h(uint32_t Leaf, uint32_t CPU) const {
++   FEXCore::CPUID::FunctionResults Res {};
++-  auto& Data = PerCPUData[CPU];
+++  auto& Data = PerCPUData[std::min<uint32_t>(CPU, PerCPUData.size() - 1)];
++   const auto RemainingStringSize = std::max<ssize_t>(0, strlen(Data.ProductName) - 16);
++   memcpy(&Res, Data.ProductName + 16, std::min<size_t>(RemainingStringSize, sizeof(FEXCore::CPUID::FunctionResults)));
++   return Res;
++@@ -1148,7 +1148,7 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0003h(uint32_t Leaf, uin
++ 
++ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_8000_0004h(uint32_t Leaf, uint32_t CPU) const {
++   FEXCore::CPUID::FunctionResults Res {};
++-  auto& Data = PerCPUData[CPU];
+++  auto& Data = PerCPUData[std::min<uint32_t>(CPU, PerCPUData.size() - 1)];
++   const auto RemainingStringSize = std::max<ssize_t>(0, strlen(Data.ProductName) - 32);
++   memcpy(&Res, Data.ProductName + 32, std::min<size_t>(RemainingStringSize, sizeof(FEXCore::CPUID::FunctionResults)));
++   return Res;
++-- 
++2.54.0 (Apple Git-157)
++
 diff --git a/patches/mtld3d/0004-d3d9-Let-GetDC-read-back-non-lockable-render-targets.patch b/patches/mtld3d/0004-d3d9-Let-GetDC-read-back-non-lockable-render-targets.patch
 new file mode 100644
 index 0000000..c27f0b6
@@ -895,11 +949,1132 @@ index 0000000..25e1e18
 +-- 
 +2.54.0 (Apple Git-157)
 +
-diff --git a/patches/wine/0030-win32u-Reparent-a-window-a-CBT-hook-turns-into-a-chi.patch b/patches/wine/0030-win32u-Reparent-a-window-a-CBT-hook-turns-into-a-chi.patch
+diff --git a/patches/wine/0034-ntdll-Clear-decommitted-guest-pages-sharing-a-host-p.patch b/patches/wine/0034-ntdll-Clear-decommitted-guest-pages-sharing-a-host-p.patch
+new file mode 100644
+index 0000000..0fe2ff6
+--- /dev/null
++++ b/patches/wine/0034-ntdll-Clear-decommitted-guest-pages-sharing-a-host-p.patch
+@@ -0,0 +1,152 @@
++From 0f269f7c2803c90a977ff4e0d8cf96bb8d48cd00 Mon Sep 17 00:00:00 2001
++From: Lennard Zehner <127147155+Moeweneier@users.noreply.github.com>
++Date: Fri, 16 Oct 2026 14:33:52 +0200
++Subject: [PATCH] ntdll: Clear partial decommitted host pages through writable
++ aliases.
++
++On 16K macOS hosts, boundary 4K guest pages retained stale contents on
++recommit. Clear partial boundaries without relaxing the host permissions
++of committed neighbours: use temporary shared writable aliases for
++ordinary pages, and the existing per-thread write mode for MAP_JIT pages.
++Prepare both aliases before writing and release them on failure.
++
++Whole host pages keep anonymous remapping; round whole-view decommit
++consistently for small views. Other hosts keep their existing boundary
++behaviour. The macOS path incurs up to two alias map/protect/unmap cycles.
++
++The 17-case zero/preservation regression passes on x86_64 and i386.
++A concurrent ARM64 writer cannot modify the protected neighbour; the old
++path with a diagnostic delay reproduces successful protected writes.
++
++---
++ dlls/ntdll/unix/virtual.c | 95 +++++++++++++++++++++++++++++++++++++--
++ 1 file changed, 92 insertions(+), 3 deletions(-)
++
++diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
++index 1b2c7db6af..e7b091da3d 100644
++--- a/dlls/ntdll/unix/virtual.c
+++++ b/dlls/ntdll/unix/virtual.c
++@@ -2685,6 +2685,71 @@ static SIZE_T get_committed_size( struct file_view *view, void *base, size_t max
++ }
++ 
++ 
+++#ifdef __APPLE__
+++/* Clear partial host pages without changing permissions on committed neighbours. */
+++static NTSTATUS zero_partial_host_pages( struct file_view *view, char *base, size_t size )
+++{
+++    struct
+++    {
+++        char *base;
+++        size_t size;
+++        mach_vm_address_t alias;
+++        BOOL jit;
+++    } partial[2] = {{0}};
+++    char *end = base + size;
+++    char *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
+++    char *host_end = ROUND_ADDR( end, host_page_mask );
+++    vm_prot_t cur_prot, max_prot;
+++    kern_return_t ret = KERN_SUCCESS;
+++    unsigned int i;
+++
+++    partial[0].base = base;
+++    partial[0].size = min( host_start, end ) - base;
+++    partial[1].base = host_end;
+++    if (host_end >= host_start && host_end < end) partial[1].size = end - host_end;
+++
+++    /* Prepare both aliases before writing, so a preparation failure leaves data intact. */
+++    for (i = 0; i < 2; i++)
+++    {
+++        char *host_base = ROUND_ADDR( partial[i].base, host_page_mask );
+++        if (!partial[i].size) continue;
+++#ifdef WX_EXCLUSIVE_HOST
+++        partial[i].jit = is_jit_view( view ) && (get_host_page_vprot( host_base ) & VPROT_EXECMODE);
+++        if (partial[i].jit) continue;
+++#endif
+++        ret = mach_vm_remap( mach_task_self(), &partial[i].alias, host_page_size, 0, VM_FLAGS_ANYWHERE,
+++                             mach_task_self(), (mach_vm_address_t)host_base, FALSE,
+++                             &cur_prot, &max_prot, VM_INHERIT_NONE );
+++        if (ret) break;
+++        ret = mach_vm_protect( mach_task_self(), partial[i].alias, host_page_size, FALSE,
+++                               VM_PROT_READ | VM_PROT_WRITE );
+++        if (ret) break;
+++    }
+++    if (!ret) for (i = 0; i < 2; i++)
+++    {
+++        char *host_base = ROUND_ADDR( partial[i].base, host_page_mask );
+++        if (!partial[i].size) continue;
+++#ifdef WX_EXCLUSIVE_HOST
+++        if (partial[i].jit)
+++        {
+++            /* MAP_JIT cannot be aliased; its write permission is already per thread. */
+++            pthread_jit_write_protect_np( 0 );
+++            memset( partial[i].base, 0, partial[i].size );
+++            pthread_jit_write_protect_np( 1 );
+++            sys_icache_invalidate( partial[i].base, partial[i].size );
+++            continue;
+++        }
+++#endif
+++        memset( (char *)partial[i].alias + (partial[i].base - host_base), 0, partial[i].size );
+++        /* The original VA may retain executable instructions after an alias write. */
+++        sys_icache_invalidate( partial[i].base, partial[i].size );
+++    }
+++    for (i = 0; i < 2; i++)
+++        if (partial[i].alias) mach_vm_deallocate( mach_task_self(), partial[i].alias, host_page_size );
+++    return ret ? STATUS_ACCESS_DENIED : STATUS_SUCCESS;
+++}
+++#endif
+++
++ /***********************************************************************
++  *           decommit_pages
++  *
++@@ -2693,14 +2758,30 @@ static SIZE_T get_committed_size( struct file_view *view, void *base, size_t max
++  */
++ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size )
++ {
++-    char *host_end, *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
+++    char *host_end, *end;
+++#ifdef __APPLE__
+++    char *partial_end;
+++#endif
+++    char *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
++ 
++     if (!size)
++     {
++         size = view->size;
++-        host_end = host_start + view->size;
+++        /* A whole view has no committed neighbour in its final host page. */
+++        host_end = (char *)ROUND_SIZE( 0, base + size, host_page_mask );
++     }
++-    else host_end = ROUND_ADDR( base + size, host_page_mask );
+++    else
+++    {
+++#ifdef __APPLE__
+++        NTSTATUS status = zero_partial_host_pages( view, base, size );
+++        if (status) return status;
+++#endif
+++        host_end = ROUND_ADDR( base + size, host_page_mask );
+++    }
+++    end = base + size;
+++#ifdef __APPLE__
+++    partial_end = min( host_start, end );
+++#endif
++ 
++     if (host_start < host_end) anon_mmap_fixed( host_start, host_end - host_start, PROT_NONE, 0 );
++ #ifdef WX_EXCLUSIVE_HOST
++@@ -2711,6 +2792,14 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size
++     }
++ #endif
++     set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
+++
+++#ifdef __APPLE__
+++    if (base < partial_end && mprotect_range( base, partial_end - base, 0, 0 ))
+++        return STATUS_ACCESS_DENIED;
+++    if (host_end >= host_start && host_end < end && mprotect_range( host_end, end - host_end, 0, 0 ))
+++        return STATUS_ACCESS_DENIED;
+++
+++#endif
++     if (host_start < host_end) kernel_writewatch_register_range( view, host_start, host_end - host_start );
++     return STATUS_SUCCESS;
++ }
++-- 
++2.47.1
++
+diff --git a/patches/wine/0035-ntdll-Clear-writable-partial-host-pages-in-place.patch b/patches/wine/0035-ntdll-Clear-writable-partial-host-pages-in-place.patch
+new file mode 100644
+index 0000000..a61fb8a
+--- /dev/null
++++ b/patches/wine/0035-ntdll-Clear-writable-partial-host-pages-in-place.patch
+@@ -0,0 +1,173 @@
++From 2da3375d2d13eeef2e101ac2b6e4df46152c7ec8 Mon Sep 17 00:00:00 2001
++From: Broyojo <dha@xoba.com>
++Date: Fri, 16 Oct 2026 16:45:40 -0400
++Subject: [PATCH] ntdll: Clear writable partial host pages in place.
++
++A host page that is already writable needs no alias: zero the decommitted
++guest pages directly. Call mprotect afterwards only when the host page's
++protection changes, which also leaves a MAP_JIT page's backing in place
++under a neighbour that may be running. Invalidate the instruction cache
++for any host page with an executable guest page, including one that is
++flipped to write mode at the moment.
++
++Whole and partial decommits take the same path: a boundary host page is
++replaced whole only when nothing else in it is in use, neither a committed
++guest page of the view nor another view, and otherwise cleared page by
++page. Replacing it releases the backing that writing zeros would fault in,
++as for a view shorter than its host page.
++---
++ dlls/ntdll/unix/virtual.c | 86 +++++++++++++++++++++++++++++----------
++ 1 file changed, 64 insertions(+), 22 deletions(-)
++
++diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
++index e7b091da3d..73e4dc56ce 100644
++--- a/dlls/ntdll/unix/virtual.c
+++++ b/dlls/ntdll/unix/virtual.c
++@@ -2686,25 +2686,44 @@ static SIZE_T get_committed_size( struct file_view *view, void *base, size_t max
++ 
++ 
++ #ifdef __APPLE__
++-/* Clear partial host pages without changing permissions on committed neighbours. */
++-static NTSTATUS zero_partial_host_pages( struct file_view *view, char *base, size_t size )
+++/* Whether the host page at host_base holds anything in use besides [start, end) of the view: a
+++ * committed guest page of the view, or another view (split placeholders can share a host page). */
+++static BOOL host_page_in_use_outside( struct file_view *view, const char *host_base,
+++                                      const char *start, const char *end )
+++{
+++    const char *page, *view_start = view->base, *view_end = view_start + view->size;
+++
+++    for (page = host_base; page < host_base + host_page_size; page += page_size)
+++    {
+++        if (page >= start && page < end) continue;
+++        if (page < view_start || page >= view_end)
+++        {
+++            if (find_view( page, 0 )) return TRUE;
+++        }
+++        else if (get_page_vprot( page ) & VPROT_COMMITTED) return TRUE;
+++    }
+++    return FALSE;
+++}
+++
+++/* Clear the guest pages of [base, end) outside [host_start, host_end) without changing
+++ * permissions on committed neighbours. */
+++static NTSTATUS zero_partial_host_pages( struct file_view *view, char *base, char *end,
+++                                         char *host_start, char *host_end )
++ {
++     struct
++     {
++         char *base;
++         size_t size;
++         mach_vm_address_t alias;
+++        BYTE vprot;
++         BOOL jit;
++     } partial[2] = {{0}};
++-    char *end = base + size;
++-    char *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
++-    char *host_end = ROUND_ADDR( end, host_page_mask );
++     vm_prot_t cur_prot, max_prot;
++     kern_return_t ret = KERN_SUCCESS;
++     unsigned int i;
++ 
++     partial[0].base = base;
++-    partial[0].size = min( host_start, end ) - base;
+++    if (base < host_start) partial[0].size = min( host_start, end ) - base;
++     partial[1].base = host_end;
++     if (host_end >= host_start && host_end < end) partial[1].size = end - host_end;
++ 
++@@ -2717,6 +2736,9 @@ static NTSTATUS zero_partial_host_pages( struct file_view *view, char *base, siz
++         partial[i].jit = is_jit_view( view ) && (get_host_page_vprot( host_base ) & VPROT_EXECMODE);
++         if (partial[i].jit) continue;
++ #endif
+++        /* A host page that is already writable is cleared in place, with no alias. */
+++        partial[i].vprot = get_host_page_vprot( host_base );
+++        if (get_unix_prot( partial[i].vprot ) & PROT_WRITE) continue;
++         ret = mach_vm_remap( mach_task_self(), &partial[i].alias, host_page_size, 0, VM_FLAGS_ANYWHERE,
++                              mach_task_self(), (mach_vm_address_t)host_base, FALSE,
++                              &cur_prot, &max_prot, VM_INHERIT_NONE );
++@@ -2740,9 +2762,12 @@ static NTSTATUS zero_partial_host_pages( struct file_view *view, char *base, siz
++             continue;
++         }
++ #endif
++-        memset( (char *)partial[i].alias + (partial[i].base - host_base), 0, partial[i].size );
++-        /* The original VA may retain executable instructions after an alias write. */
++-        sys_icache_invalidate( partial[i].base, partial[i].size );
+++        if (partial[i].alias)
+++            memset( (char *)partial[i].alias + (partial[i].base - host_base), 0, partial[i].size );
+++        else
+++            memset( partial[i].base, 0, partial[i].size );
+++        /* An executable page may have run code from here, even one now flipped to write mode. */
+++        if (partial[i].vprot & VPROT_EXEC) sys_icache_invalidate( partial[i].base, partial[i].size );
++     }
++     for (i = 0; i < 2; i++)
++         if (partial[i].alias) mach_vm_deallocate( mach_task_self(), partial[i].alias, host_page_size );
++@@ -2761,23 +2786,31 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size
++     char *host_end, *end;
++ #ifdef __APPLE__
++     char *partial_end;
+++    int head_prot, tail_prot;
++ #endif
++     char *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
+++    BOOL whole = !size;
++ 
++-    if (!size)
+++    if (whole) size = view->size;
+++#ifdef __APPLE__
+++    host_end = ROUND_ADDR( base + size, host_page_mask );
++     {
++-        size = view->size;
++-        /* A whole view has no committed neighbour in its final host page. */
++-        host_end = (char *)ROUND_SIZE( 0, base + size, host_page_mask );
+++        char *head = ROUND_ADDR( base, host_page_mask );
+++        NTSTATUS status;
+++
+++        /* A partial host page with nothing else in use is replaced whole: that zeroes it and
+++         * releases its backing, which writing zeros would instead fault in. One shared with
+++         * committed pages or another view is cleared page by page, whole view or not. */
+++        if (head < host_start && !host_page_in_use_outside( view, head, base, base + size ))
+++            host_start = head;
+++        if (host_end < base + size && !host_page_in_use_outside( view, host_end, base, base + size ))
+++            host_end += host_page_size;
+++        if ((status = zero_partial_host_pages( view, base, base + size, host_start, host_end )))
+++            return status;
++     }
++-    else
++-    {
++-#ifdef __APPLE__
++-        NTSTATUS status = zero_partial_host_pages( view, base, size );
++-        if (status) return status;
+++#else
+++    host_end = whole ? host_start + size : ROUND_ADDR( base + size, host_page_mask );
++ #endif
++-        host_end = ROUND_ADDR( base + size, host_page_mask );
++-    }
++     end = base + size;
++ #ifdef __APPLE__
++     partial_end = min( host_start, end );
++@@ -2790,13 +2823,22 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size
++         /* the replaced host pages are no longer MAP_JIT-backed */
++         if (host_start < host_end) set_page_vprot_bits( host_start, host_end - host_start, 0, VPROT_EXECMODE );
++     }
+++#endif
+++#ifdef __APPLE__
+++    head_prot = get_unix_prot( get_host_page_vprot( base ) );
+++    tail_prot = get_unix_prot( get_host_page_vprot( host_end ) );
++ #endif
++     set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
++ 
++ #ifdef __APPLE__
++-    if (base < partial_end && mprotect_range( base, partial_end - base, 0, 0 ))
+++    /* Committed neighbours usually keep a partial host page's protection unchanged; leaving it
+++     * alone also keeps a MAP_JIT page's backing in place under a neighbour that may be running. */
+++    if (base < partial_end && get_unix_prot( get_host_page_vprot( base ) ) != head_prot &&
+++        mprotect_range( base, partial_end - base, 0, 0 ))
++         return STATUS_ACCESS_DENIED;
++-    if (host_end >= host_start && host_end < end && mprotect_range( host_end, end - host_end, 0, 0 ))
+++    if (host_end >= host_start && host_end < end &&
+++        get_unix_prot( get_host_page_vprot( host_end ) ) != tail_prot &&
+++        mprotect_range( host_end, end - host_end, 0, 0 ))
++         return STATUS_ACCESS_DENIED;
++ 
++ #endif
++-- 
++2.54.0 (Apple Git-157)
++
+diff --git a/patches/wine/0036-ntdll-Map-unaligned-shared-image-sections-as-private.patch b/patches/wine/0036-ntdll-Map-unaligned-shared-image-sections-as-private.patch
+new file mode 100644
+index 0000000..9d591c6
+--- /dev/null
++++ b/patches/wine/0036-ntdll-Map-unaligned-shared-image-sections-as-private.patch
+@@ -0,0 +1,62 @@
++From 9187e812cd03114bb3d304c51d2ef34cf5d9d766 Mon Sep 17 00:00:00 2001
++From: Broyojo <dha@xoba.com>
++Date: Fri, 16 Oct 2026 18:05:36 -0400
++Subject: [PATCH] ntdll: Map unaligned shared image sections as private copies.
++
++A writable shared section is mapped from wineserver's shared-section file,
++which needs whole host pages. With host pages larger than the image's (16 KB
++on Apple silicon), a section that shares its host pages with other sections,
++or sits at an unaligned offset in that file, cannot be mapped shared, and the
++image failed to load. Map a private copy of such a section instead: correct
++for one process, but not shared with other instances of the image. A private
++copy also skips the private remapping of an import directory inside the
++section, which only a shared mapping needs.
++---
++ dlls/ntdll/unix/virtual.c | 22 ++++++++++++++++++----
++ 1 file changed, 18 insertions(+), 4 deletions(-)
++
++diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
++index 73e4dc56ce..b1d805dd25 100644
++--- a/dlls/ntdll/unix/virtual.c
+++++ b/dlls/ntdll/unix/virtual.c
++@@ -3509,19 +3509,33 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
++         if ((sec[i].Characteristics & IMAGE_SCN_MEM_SHARED) &&
++             (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE))
++         {
+++            char *addr = ptr + sec[i].VirtualAddress;
+++            unsigned int shared_vprot = VPROT_COMMITTED | VPROT_READ | VPROT_WRITE;
+++
++             TRACE_(module)( "%s mapping shared section %.8s at %p off %x (%x) size %lx (%lx) flags %x\n",
++-                            debugstr_us(nt_name), sec[i].Name, ptr + sec[i].VirtualAddress,
+++                            debugstr_us(nt_name), sec[i].Name, addr,
++                             sec[i].PointerToRawData, (int)pos, file_size, map_size,
++                             sec[i].Characteristics );
+++            /* A shared mapping needs whole host pages. With host pages larger than the image's
+++             * pages, a section sharing its host pages with others can only get a private copy:
+++             * correct for one process, but not shared with other instances of the image. */
+++            if (((UINT_PTR)addr & host_page_mask) || (pos & host_page_mask) ||
+++                ((map_size & host_page_mask) && addr + map_size < (char *)view->base + view->size))
+++            {
+++                FIXME_(module)( "%s shared section %.8s is not host page aligned, mapping a private copy\n",
+++                                debugstr_us(nt_name), sec[i].Name );
+++                shared_vprot = VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY;
+++            }
++             if (map_file_into_view( view, shared_fd, sec[i].VirtualAddress, map_size, pos,
++-                                    VPROT_COMMITTED | VPROT_READ | VPROT_WRITE, FALSE ) != STATUS_SUCCESS)
+++                                    shared_vprot, FALSE ) != STATUS_SUCCESS)
++             {
++                 ERR_(module)( "Could not map %s shared section %.8s\n", debugstr_us(nt_name), sec[i].Name );
++                 goto done;
++             }
++ 
++-            /* check if the import directory falls inside this section */
++-            if (imports && imports->VirtualAddress >= sec[i].VirtualAddress &&
+++            /* check if the import directory falls inside this section; a private copy needs no
+++             * private remapping of it */
+++            if ((shared_vprot & VPROT_WRITE) && imports && imports->VirtualAddress >= sec[i].VirtualAddress &&
++                 imports->VirtualAddress < sec[i].VirtualAddress + map_size)
++             {
++                 UINT_PTR base = imports->VirtualAddress & ~host_page_mask;
++-- 
++2.54.0 (Apple Git-157)
++
+diff --git a/patches/wine/0038-winemac.drv-Don-t-double-HORZRES-and-VERTRES-in-Reti.patch b/patches/wine/0038-winemac.drv-Don-t-double-HORZRES-and-VERTRES-in-Reti.patch
+new file mode 100644
+index 0000000..8cb77b3
+--- /dev/null
++++ b/patches/wine/0038-winemac.drv-Don-t-double-HORZRES-and-VERTRES-in-Reti.patch
+@@ -0,0 +1,32 @@
++From 4f5afb1a98b48c6299e66a8bd274f7b83871a5e8 Mon Sep 17 00:00:00 2001
++From: Broyojo <dha@xoba.com>
++Date: Sat, 17 Oct 2026 01:19:31 -0400
++Subject: [PATCH 38/38] winemac.drv: Don't double HORZRES and VERTRES in Retina
++ mode.
++
++In Retina mode the display's rectangle is already in pixels, and win32u's
++fallback returns its size, so doubling it reported twice the screen width:
++HORZRES 6048 against SM_CXSCREEN 3024 on a 3024x1964 display.
++---
++ dlls/winemac.drv/gdi.c | 5 +----
++ 1 file changed, 1 insertion(+), 4 deletions(-)
++
++diff --git a/dlls/winemac.drv/gdi.c b/dlls/winemac.drv/gdi.c
++index 69a0aa7faf..145c9d3ec8 100644
++--- a/dlls/winemac.drv/gdi.c
+++++ b/dlls/winemac.drv/gdi.c
++@@ -216,10 +216,7 @@ static INT macdrv_GetDeviceCaps(PHYSDEV dev, INT cap)
++     default:
++         pthread_mutex_unlock(&device_data_mutex);
++         dev = GET_NEXT_PHYSDEV( dev, pGetDeviceCaps );
++-        ret = dev->funcs->pGetDeviceCaps( dev, cap );
++-        if ((cap == HORZRES || cap == VERTRES) && retina_on)
++-            ret *= 2;
++-        return ret;
+++        return dev->funcs->pGetDeviceCaps( dev, cap );
++     }
++ 
++     TRACE("cap %d -> %d\n", cap, ret);
++-- 
++2.54.0 (Apple Git-157)
++
+diff --git a/patches/wine/0039-winemac.drv-Keep-a-cursor-s-size-in-points-in-Retina.patch b/patches/wine/0039-winemac.drv-Keep-a-cursor-s-size-in-points-in-Retina.patch
+new file mode 100644
+index 0000000..3502d69
+--- /dev/null
++++ b/patches/wine/0039-winemac.drv-Keep-a-cursor-s-size-in-points-in-Retina.patch
+@@ -0,0 +1,38 @@
++From 12f3c8770be19779603131798e00dd029734ca2f Mon Sep 17 00:00:00 2001
++From: Broyojo <dha@xoba.com>
++Date: Tue, 20 Oct 2026 02:01:40 -0400
++Subject: [PATCH] winemac.drv: Keep a cursor's size in points in Retina mode.
++
++A cursor's image covered half as many points as it has pixels in Retina
++mode, so a game's own cursor was half the size of the Mac's pointer and
++of the same cursor without Retina mode.
++---
++ dlls/winemac.drv/cocoa_app.m | 6 ++++--
++ 1 file changed, 4 insertions(+), 2 deletions(-)
++
++diff --git a/dlls/winemac.drv/cocoa_app.m b/dlls/winemac.drv/cocoa_app.m
++index 606cd20383..c42327430d 100644
++--- a/dlls/winemac.drv/cocoa_app.m
+++++ b/dlls/winemac.drv/cocoa_app.m
++@@ -1084,14 +1084,16 @@ - (void) setCursor
++     {
++         NSDictionary* frame = cursorFrames[cursorFrame];
++         CGImageRef cgimage = (CGImageRef)frame[@"image"];
+++        /* A cursor covers a point for each of its pixels, in Retina mode too, as the Mac's own
+++           cursors do: halved to the display's pixels, a game's cursor is half the size of the
+++           Mac's pointer and of what the game shows on a display without Retina mode. */
++         CGSize size = CGSizeMake(CGImageGetWidth(cgimage), CGImageGetHeight(cgimage));
++-        NSImage* image = [[NSImage alloc] initWithCGImage:cgimage size:NSSizeFromCGSize(cgsize_mac_from_win(size))];
+++        NSImage* image = [[NSImage alloc] initWithCGImage:cgimage size:NSSizeFromCGSize(size)];
++         CFDictionaryRef hotSpotDict = (CFDictionaryRef)frame[@"hotSpot"];
++         CGPoint hotSpot;
++ 
++         if (!CGPointMakeWithDictionaryRepresentation(hotSpotDict, &hotSpot))
++             hotSpot = CGPointZero;
++-        hotSpot = cgpoint_mac_from_win(hotSpot);
++         self.cursor = [[[NSCursor alloc] initWithImage:image hotSpot:NSPointFromCGPoint(hotSpot)] autorelease];
++         [image release];
++         [self unhideCursor];
++-- 
++2.54.0 (Apple Git-157)
++
+diff --git a/patches/wine/0040-ntdll-Keep-top-down-allocations-above-4GB-while-ther.patch b/patches/wine/0040-ntdll-Keep-top-down-allocations-above-4GB-while-ther.patch
+new file mode 100644
+index 0000000..d204d9f
+--- /dev/null
++++ b/patches/wine/0040-ntdll-Keep-top-down-allocations-above-4GB-while-ther.patch
+@@ -0,0 +1,54 @@
++From f3242c66243a5235256334f3e9aae425f5f10fb2 Mon Sep 17 00:00:00 2001
++From: Broyojo <dha@xoba.com>
++Date: Wed, 21 Oct 2026 09:22:22 -0400
++Subject: [PATCH] ntdll: Keep top-down allocations above 4GB while there is
++ room.
++
++map_view() looks in the reserved areas before free memory, highest area
++first. When a top-down request does not fit the top-down area, the next
++area down is the low one, so the request lands just below 4GB, although
++the address space between 4GB and the top-down area is free.
++
++Windows gives a top-down allocation the highest free address, and the
++space below 4GB is what programs needing 32-bit addresses depend on, such
++as LuaJIT asking for memory below 2GB with ZeroBits. FEX reserves large
++blocks top-down in every x64 process. Try the part of the range above 4GB
++first, the reserved areas and then free memory, and only then the rest.
++---
++ dlls/ntdll/unix/virtual.c | 20 ++++++++++++++++++++
++ 1 file changed, 20 insertions(+)
++
++diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
++index b1d805dd25..4451a28174 100644
++--- a/dlls/ntdll/unix/virtual.c
+++++ b/dlls/ntdll/unix/virtual.c
++@@ -2524,6 +2524,26 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
++         if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
++         if (limit_high && (void *)limit_high < end) end = (char *)limit_high + 1;
++ 
+++#ifdef _WIN64
+++        /* Windows gives a top-down allocation the highest free address, so it only goes below
+++         * 4GB when nothing above is free. Don't let one that does not fit the top-down area
+++         * fall into the low reserved area while there is room above 4GB: programs that need
+++         * 32-bit addresses depend on that space. */
+++        if (top_down && start < (void *)limit_4g && end > (void *)limit_4g)
+++        {
+++            if ((ptr = map_reserved_area( (void *)limit_4g, end, host_size, top_down, unix_prot, align_mask )))
+++            {
+++                TRACE( "got mem in reserved area %p-%p\n", ptr, (char *)ptr + size );
+++                goto done;
+++            }
+++            if ((ptr = map_free_area( (void *)limit_4g, end, host_size, top_down, unix_prot, align_mask )))
+++            {
+++                TRACE( "got mem with map_free_area %p-%p\n", ptr, (char *)ptr + size );
+++                goto done;
+++            }
+++        }
+++#endif
+++
++         if ((ptr = map_reserved_area( start, end, host_size, top_down, unix_prot, align_mask )))
++         {
++             TRACE( "got mem in reserved area %p-%p\n", ptr, (char *)ptr + size );
++-- 
++2.54.0 (Apple Git-157)
++
+diff --git a/patches/wine/0041-ntdll-Return-FALSE-from-RtlIsEcCode-for-addresses-ab.patch b/patches/wine/0041-ntdll-Return-FALSE-from-RtlIsEcCode-for-addresses-ab.patch
+new file mode 100644
+index 0000000..4d66fa2
+--- /dev/null
++++ b/patches/wine/0041-ntdll-Return-FALSE-from-RtlIsEcCode-for-addresses-ab.patch
+@@ -0,0 +1,50 @@
++From 342cb56a59826c8f3896163e8261a6f188897b98 Mon Sep 17 00:00:00 2001
++From: Broyojo <dha@xoba.com>
++Date: Wed, 21 Oct 2026 09:22:23 -0400
++Subject: [PATCH] ntdll: Return FALSE from RtlIsEcCode for addresses above the
++ user space.
++
++An unwinder asks RtlIsEcCode about whatever it takes for a return
++address, and RtlIsEcCode indexed the EC code bitmap with it unchecked.
++A value past the bitmap faulted, and dispatching that fault unwound
++through the same frames and faulted again until the stack overflowed.
++
++Size the bitmap for the whole 47-bit user address space whatever the
++host's limit, and return FALSE for addresses above it.
++---
++ dlls/ntdll/signal_arm64ec.c | 3 +++
++ dlls/ntdll/unix/virtual.c   | 4 +++-
++ 2 files changed, 6 insertions(+), 1 deletion(-)
++
++diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
++index beea4ecabb..45e847a105 100644
++--- a/dlls/ntdll/signal_arm64ec.c
+++++ b/dlls/ntdll/signal_arm64ec.c
++@@ -1394,6 +1394,9 @@ BOOLEAN WINAPI RtlIsEcCode( ULONG_PTR ptr )
++ {
++     const UINT64 *map = (const UINT64 *)NtCurrentTeb()->Peb->EcCodeBitMap;
++     ULONG_PTR page = ptr / page_size;
+++
+++    /* the map covers the 47-bit user address space; an unwinder can ask about any value */
+++    if (ptr >> 47) return FALSE;
++     return (map[page / 64] >> (page & 63)) & 1;
++ }
++ 
++diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
++index 4451a28174..8e0497e0ca 100644
++--- a/dlls/ntdll/unix/virtual.c
+++++ b/dlls/ntdll/unix/virtual.c
++@@ -3197,7 +3197,9 @@ BOOL is_emulated_code( ULONG_PTR ptr )
++ static void alloc_arm64ec_map(void)
++ {
++     unsigned int status;
++-    SIZE_T size = ((ULONG_PTR)address_space_limit + page_size) >> (page_shift + 3);  /* one bit per page */
+++    /* one bit per page of the 47-bit user address space, whatever the host's limit, so that
+++     * RtlIsEcCode only has to check that an address is below 1 << 47 */
+++    SIZE_T size = ((ULONG_PTR)1 << 47) >> (page_shift + 3);
++ 
++     size = ROUND_SIZE( 0, size, host_page_mask );
++     status = map_view( &arm64ec_view, NULL, size, MEM_TOP_DOWN, VPROT_READ | VPROT_COMMITTED, 0, 0, 0 );
++-- 
++2.54.0 (Apple Git-157)
++
+diff --git a/patches/wine/0042-wineboot-Don-t-show-a-window-while-updating-a-prefix.patch b/patches/wine/0042-wineboot-Don-t-show-a-window-while-updating-a-prefix.patch
+new file mode 100644
+index 0000000..b56ee0d
+--- /dev/null
++++ b/patches/wine/0042-wineboot-Don-t-show-a-window-while-updating-a-prefix.patch
+@@ -0,0 +1,100 @@
++From 2e2333faa4e64133b721405c64183b46162a959e Mon Sep 17 00:00:00 2001
++From: Broyojo <dha@xoba.com>
++Date: Wed, 21 Oct 2026 09:27:43 -0400
++Subject: [PATCH] wineboot: Don't show a window while updating a prefix.
++
++The update runs before a program starts, and the window, a process of
++its own with no icon, appears with a blank icon in the Dock on macOS.
++Nothing in it needs the user. Proton's wineboot shows none either.
++---
++ programs/wineboot/wineboot.c | 60 ------------------------------------
++ 1 file changed, 60 deletions(-)
++
++diff --git a/programs/wineboot/wineboot.c b/programs/wineboot/wineboot.c
++index b49ad3c005..e3484342b2 100644
++--- a/programs/wineboot/wineboot.c
+++++ b/programs/wineboot/wineboot.c
++@@ -1495,64 +1495,6 @@ static BOOL start_services_process(void)
++     return TRUE;
++ }
++ 
++-static void set_wait_dialog_text( HWND hwnd, HWND text, const WCHAR *string )
++-{
++-    RECT win_rect, old_rect, new_rect;
++-    HDC hdc = GetDC( text );
++-
++-    GetClientRect( text, &old_rect );
++-    new_rect = old_rect;
++-    SelectObject( hdc, (HFONT)SendMessageW( text, WM_GETFONT, 0, 0 ));
++-    DrawTextW( hdc, string, -1, &new_rect, DT_CALCRECT | DT_EDITCONTROL | DT_WORDBREAK | DT_NOPREFIX );
++-    ReleaseDC( text, hdc );
++-    if (new_rect.bottom > old_rect.bottom)
++-    {
++-        GetWindowRect( hwnd, &win_rect );
++-        win_rect.bottom += new_rect.bottom - old_rect.bottom;
++-        SetWindowPos( hwnd, 0, 0, 0, win_rect.right - win_rect.left, win_rect.bottom - win_rect.top,
++-                      SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER );
++-        SetWindowPos( text, 0, 0, 0, new_rect.right, new_rect.bottom,
++-                      SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER );
++-    }
++-    SendMessageW( text, WM_SETTEXT, 0, (LPARAM)string );
++-}
++-
++-static INT_PTR CALLBACK wait_dlgproc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
++-{
++-    switch (msg)
++-    {
++-    case WM_INITDIALOG:
++-        {
++-            DWORD len, icon_size;
++-            RECT rect;
++-            WCHAR *buffer, text[1024];
++-            const WCHAR *name = (WCHAR *)lp;
++-            HICON icon;
++-
++-            GetClientRect( GetDlgItem( hwnd, IDC_WAITICON ), &rect );
++-            icon_size = min( rect.right, rect.bottom );
++-            icon = LoadImageW( 0, (LPCWSTR)IDI_WINLOGO, IMAGE_ICON, icon_size, icon_size, LR_SHARED );
++-            SendDlgItemMessageW( hwnd, IDC_WAITICON, STM_SETICON, (WPARAM)icon, 0 );
++-            SendDlgItemMessageW( hwnd, IDC_WAITTEXT, WM_GETTEXT, 1024, (LPARAM)text );
++-            len = lstrlenW(text) + lstrlenW(name) + 1;
++-            buffer = malloc( len * sizeof(WCHAR) );
++-            swprintf( buffer, len, text, name );
++-            set_wait_dialog_text( hwnd, GetDlgItem( hwnd, IDC_WAITTEXT ), buffer );
++-            free( buffer );
++-        }
++-        break;
++-    }
++-    return 0;
++-}
++-
++-static HWND show_wait_window(void)
++-{
++-    HWND hwnd = CreateDialogParamW( GetModuleHandleW(0), MAKEINTRESOURCEW(IDD_WAITDLG), 0,
++-                                    wait_dlgproc, (LPARAM)prettyprint_configdir() );
++-    ShowWindow( hwnd, SW_SHOWNORMAL );
++-    return hwnd;
++-}
++-
++ static HANDLE start_rundll32( const WCHAR *inf_path, const WCHAR *install, WORD machine )
++ {
++     WCHAR app[MAX_PATH + ARRAY_SIZE(L"\\rundll32.exe" )];
++@@ -1701,7 +1643,6 @@ static void update_wineprefix( BOOL force )
++ 
++         if ((process = start_rundll32( inf_path, L"PreInstall", IMAGE_FILE_MACHINE_TARGET_HOST )))
++         {
++-            HWND hwnd = show_wait_window();
++             for (;;)
++             {
++                 if (process)
++@@ -1722,7 +1663,6 @@ static void update_wineprefix( BOOL force )
++                     process = start_rundll32( inf_path, L"Wow64Install", machines[count].Machine );
++                 count++;
++             }
++-            DestroyWindow( hwnd );
++         }
++         install_root_pnp_devices();
++         update_user_profile();
++-- 
++2.54.0 (Apple Git-157)
++
+diff --git a/patches/wine/0044-imm32-Do-not-classify-aliased-HKLs-as-IME.patch b/patches/wine/0044-imm32-Do-not-classify-aliased-HKLs-as-IME.patch
+new file mode 100644
+index 0000000..5547255
+--- /dev/null
++++ b/patches/wine/0044-imm32-Do-not-classify-aliased-HKLs-as-IME.patch
+@@ -0,0 +1,68 @@
++From ca960d2da3650466b231800321deb793114cd5d6 Mon Sep 17 00:00:00 2001
++From: Marc-Aurel Zent <mzent@codeweavers.com>
++Date: Thu, 1 Oct 2026 12:49:00 +0200
++Subject: [PATCH] imm32: Do not classify aliased HKLs as IME.
++
++(cherry picked from commit a07e981c59419c9cb89e3282fcd30c35d8450f97)
++---
++ dlls/imm32/ime.c                        | 2 +-
++ dlls/winemac.drv/keyboard.c             | 2 +-
++ dlls/winewayland.drv/wayland_keyboard.c | 2 +-
++ dlls/winex11.drv/xim.c                  | 2 +-
++ 4 files changed, 4 insertions(+), 4 deletions(-)
++
++diff --git a/dlls/imm32/ime.c b/dlls/imm32/ime.c
++index 37c4d073e1..a6663d7972 100644
++--- a/dlls/imm32/ime.c
+++++ b/dlls/imm32/ime.c
++@@ -48,7 +48,7 @@ static BOOL is_ime_hkl( HKL hkl )
++     case MAKELANGID(LANG_TIGRINYA, SUBLANG_TIGRINYA_ETHIOPIA): return TRUE;
++     case MAKELANGID(LANG_VIETNAMESE, SUBLANG_VIETNAMESE_VIETNAM): return TRUE;
++     case MAKELANGID(LANG_YI, SUBLANG_YI_PRC): return TRUE;
++-    default: return (HIWORD(hkl) & 0xe000) == 0xe000;
+++    default: return (HIWORD(hkl) & 0xf000) == 0xe000;
++     }
++ }
++ 
++diff --git a/dlls/winemac.drv/keyboard.c b/dlls/winemac.drv/keyboard.c
++index dfc02eaf19..c5fa53f1c5 100644
++--- a/dlls/winemac.drv/keyboard.c
+++++ b/dlls/winemac.drv/keyboard.c
++@@ -59,7 +59,7 @@ static BOOL is_ime_hkl( HKL hkl )
++     case MAKELANGID(LANG_TIGRINYA, SUBLANG_TIGRINYA_ETHIOPIA): return TRUE;
++     case MAKELANGID(LANG_VIETNAMESE, SUBLANG_VIETNAMESE_VIETNAM): return TRUE;
++     case MAKELANGID(LANG_YI, SUBLANG_YI_PRC): return TRUE;
++-    default: return (HIWORD(hkl) & 0xe000) == 0xe000;
+++    default: return (HIWORD(hkl) & 0xf000) == 0xe000;
++     }
++ }
++ 
++diff --git a/dlls/winewayland.drv/wayland_keyboard.c b/dlls/winewayland.drv/wayland_keyboard.c
++index 0a6eea2fa7..5154e03c24 100644
++--- a/dlls/winewayland.drv/wayland_keyboard.c
+++++ b/dlls/winewayland.drv/wayland_keyboard.c
++@@ -63,7 +63,7 @@ static BOOL is_ime_hkl(HKL hkl)
++     case MAKELANGID(LANG_TIGRINYA, SUBLANG_TIGRINYA_ETHIOPIA): return TRUE;
++     case MAKELANGID(LANG_VIETNAMESE, SUBLANG_VIETNAMESE_VIETNAM): return TRUE;
++     case MAKELANGID(LANG_YI, SUBLANG_YI_PRC): return TRUE;
++-    default: return (HIWORD(hkl) & 0xe000) == 0xe000;
+++    default: return (HIWORD(hkl) & 0xf000) == 0xe000;
++     }
++ }
++ 
++diff --git a/dlls/winex11.drv/xim.c b/dlls/winex11.drv/xim.c
++index 2c2049ac76..b2d2f90297 100644
++--- a/dlls/winex11.drv/xim.c
+++++ b/dlls/winex11.drv/xim.c
++@@ -99,7 +99,7 @@ static BOOL is_ime_hkl( HKL hkl )
++     case MAKELANGID(LANG_TIGRINYA, SUBLANG_TIGRINYA_ETHIOPIA): return TRUE;
++     case MAKELANGID(LANG_VIETNAMESE, SUBLANG_VIETNAMESE_VIETNAM): return TRUE;
++     case MAKELANGID(LANG_YI, SUBLANG_YI_PRC): return TRUE;
++-    default: return (HIWORD(hkl) & 0xe000) == 0xe000;
+++    default: return (HIWORD(hkl) & 0xf000) == 0xe000;
++     }
++ }
++ 
++-- 
++2.54.0 (Apple Git-157)
++
+diff --git a/patches/wine/0047-winemac.drv-Report-raw-mouse-movement-in-points.patch b/patches/wine/0047-winemac.drv-Report-raw-mouse-movement-in-points.patch
+new file mode 100644
+index 0000000..f6d8ac1
+--- /dev/null
++++ b/patches/wine/0047-winemac.drv-Report-raw-mouse-movement-in-points.patch
+@@ -0,0 +1,232 @@
++From 43128926d3a11e3a1ab4b7922fb4fff989629b5a Mon Sep 17 00:00:00 2001
++From: Broyojo <dha@xoba.com>
++Date: Mon, 26 Oct 2026 15:09:46 -0400
++Subject: [PATCH] winemac.drv: Report raw mouse movement in points.
++
++Raw input took its movement from the cursor's position, which is in
++pixels in Retina mode, so mouselook turned twice as fast there. Like the
++X11 and Wayland drivers, send the raw movement separately. Take it from
++the event's location in points, starting again where a warp put the
++cursor: the deltas of the first event after a warp include the warp,
++which games that put the cursor back after each move do every frame.
++---
++ dlls/winemac.drv/cocoa_app.h    |  3 +++
++ dlls/winemac.drv/cocoa_app.m    | 38 ++++++++++++++++++++++++++++++++-
++ dlls/winemac.drv/cocoa_event.m  |  2 ++
++ dlls/winemac.drv/macdrv_cocoa.h |  2 ++
++ dlls/winemac.drv/mouse.c        | 29 ++++++++++++++++---------
++ 5 files changed, 63 insertions(+), 11 deletions(-)
++
++diff --git a/dlls/winemac.drv/cocoa_app.h b/dlls/winemac.drv/cocoa_app.h
++index 14539ec1be..be69d04cc0 100644
++--- a/dlls/winemac.drv/cocoa_app.h
+++++ b/dlls/winemac.drv/cocoa_app.h
++@@ -69,6 +69,9 @@ @interface WineApplicationController : NSObject <NSApplicationDelegate>
++     WineWindow* mouseCaptureWindow;
++     BOOL forceNextMouseMoveAbsolute;
++     double mouseMoveDeltaX, mouseMoveDeltaY;
+++    double rawMoveDeltaX, rawMoveDeltaY;
+++    CGPoint rawMovePoint;
+++    BOOL rawMovePointValid;
++     NSUInteger unmatchedMouseDowns;
++ 
++     NSTimeInterval lastScrollTime;
++diff --git a/dlls/winemac.drv/cocoa_app.m b/dlls/winemac.drv/cocoa_app.m
++index c42327430d..f3a23ce5d2 100644
++--- a/dlls/winemac.drv/cocoa_app.m
+++++ b/dlls/winemac.drv/cocoa_app.m
++@@ -1278,6 +1278,10 @@ - (BOOL) setCursorPosition:(CGPoint)pos
++         {
++             WineEventQueue* queue;
++ 
+++            // Raw movement goes on from where the cursor was put.
+++            rawMovePoint = pos;
+++            rawMovePointValid = TRUE;
+++
++             // Discard all pending mouse move events.
++             [eventQueuesLock lock];
++             for (queue in eventQueues)
++@@ -1451,6 +1455,7 @@ - (void) handleMouseMove:(NSEvent*)anEvent
++             CGPoint point = CGEventGetLocation([anEvent CGEvent]);
++             macdrv_event* event;
++             BOOL absolute;
+++            int raw_x, raw_y;
++ 
++             // If we recently warped the cursor (other than in our cursor-clipping
++             // event tap), discard mouse move events until we see an event which is
++@@ -1520,6 +1525,19 @@ - (void) handleMouseMove:(NSEvent*)anEvent
++             {
++                 if (self.clippingCursor)
++                     [clipCursorHandler clipCursorLocation:&point];
+++
+++                // Raw input reports the movement in points, which doesn't
+++                // depend on the display's pixel density, as on Windows.  It's
+++                // taken from the location, not the event's deltas: those
+++                // include the cursor's last warp.
+++                if (rawMovePointValid)
+++                {
+++                    rawMoveDeltaX += point.x - rawMovePoint.x;
+++                    rawMoveDeltaY += point.y - rawMovePoint.y;
+++                }
+++                rawMovePoint = point;
+++                rawMovePointValid = TRUE;
+++
++                 point = cgpoint_win_from_mac(point);
++ 
++                 event = macdrv_create_event(MOUSE_MOVED_ABSOLUTE, targetWindow);
++@@ -1537,6 +1555,12 @@ - (void) handleMouseMove:(NSEvent*)anEvent
++                 /* deltaY is already flipped */
++                 mouseMoveDeltaX += [anEvent deltaX];
++                 mouseMoveDeltaY += [anEvent deltaY];
+++                rawMoveDeltaX += [anEvent deltaX];
+++                rawMoveDeltaY += [anEvent deltaY];
+++                if (self.clippingCursor)
+++                    [clipCursorHandler clipCursorLocation:&point];
+++                rawMovePoint = point;
+++                rawMovePointValid = TRUE;
++ 
++                 event = macdrv_create_event(MOUSE_MOVED_RELATIVE, targetWindow);
++                 event->mouse_moved.x = mouseMoveDeltaX * scale;
++@@ -1547,7 +1571,16 @@ - (void) handleMouseMove:(NSEvent*)anEvent
++                 mouseMoveDeltaY -= event->mouse_moved.y / scale;
++             }
++ 
++-            if (event->type == MOUSE_MOVED_ABSOLUTE || event->mouse_moved.x || event->mouse_moved.y)
+++            /* Keep the remainder after integer truncation. */
+++            raw_x = rawMoveDeltaX;
+++            raw_y = rawMoveDeltaY;
+++            rawMoveDeltaX -= raw_x;
+++            rawMoveDeltaY -= raw_y;
+++            event->mouse_moved.raw_x = raw_x;
+++            event->mouse_moved.raw_y = raw_y;
+++
+++            if (event->type == MOUSE_MOVED_ABSOLUTE || event->mouse_moved.x || event->mouse_moved.y ||
+++                event->mouse_moved.raw_x || event->mouse_moved.raw_y)
++             {
++                 event->mouse_moved.time_ms = [self ticksForEventTime:[anEvent timestamp]];
++                 event->mouse_moved.drag = drag;
++@@ -1560,7 +1593,10 @@ - (void) handleMouseMove:(NSEvent*)anEvent
++             lastTargetWindow = targetWindow;
++         }
++         else
+++        {
++             lastTargetWindow = nil;
+++            rawMovePointValid = FALSE;
+++        }
++ 
++         [self updateCursor:FALSE];
++     }
++diff --git a/dlls/winemac.drv/cocoa_event.m b/dlls/winemac.drv/cocoa_event.m
++index 3389271a8f..6a62077e1f 100644
++--- a/dlls/winemac.drv/cocoa_event.m
+++++ b/dlls/winemac.drv/cocoa_event.m
++@@ -229,6 +229,8 @@ - (void) postEventObject:(MacDrvEvent*)event
++                 lastEvent->event->mouse_moved.x = event->event->mouse_moved.x;
++                 lastEvent->event->mouse_moved.y = event->event->mouse_moved.y;
++             }
+++            lastEvent->event->mouse_moved.raw_x += event->event->mouse_moved.raw_x;
+++            lastEvent->event->mouse_moved.raw_y += event->event->mouse_moved.raw_y;
++ 
++             lastEvent->event->mouse_moved.time_ms = event->event->mouse_moved.time_ms;
++         }
++diff --git a/dlls/winemac.drv/macdrv_cocoa.h b/dlls/winemac.drv/macdrv_cocoa.h
++index 8f2e9664eb..0c5523654d 100644
++--- a/dlls/winemac.drv/macdrv_cocoa.h
+++++ b/dlls/winemac.drv/macdrv_cocoa.h
++@@ -367,6 +367,8 @@ static inline CGPoint cgpoint_win_from_mac(CGPoint point)
++         struct {
++             int             x;
++             int             y;
+++            int             raw_x;
+++            int             raw_y;
++             bool            drag;
++             unsigned long   time_ms;
++         }                                           mouse_moved;
++diff --git a/dlls/winemac.drv/mouse.c b/dlls/winemac.drv/mouse.c
++index 8c3c2f6ba7..0c9ba0393b 100644
++--- a/dlls/winemac.drv/mouse.c
+++++ b/dlls/winemac.drv/mouse.c
++@@ -131,7 +131,7 @@ static const CFStringRef cocoa_cursor_names[] =
++  * Update the various window states on a mouse event.
++  */
++ static void send_mouse_input(HWND hwnd, WineWindow *cocoa_window, UINT flags, int x, int y,
++-                             DWORD mouse_data, BOOL drag, unsigned long time)
+++                             DWORD mouse_data, BOOL drag, unsigned long time, const struct raw_mouse *raw)
++ {
++     INPUT input;
++ 
++@@ -143,7 +143,8 @@ static void send_mouse_input(HWND hwnd, WineWindow *cocoa_window, UINT flags, in
++     input.mi.time           = time;
++     input.mi.dwExtraInfo    = 0;
++ 
++-    NtUserSendHardwareInput(hwnd, 0, &input, 0);
+++    /* raw input gets the movement in raw, and none from the cursor's position */
+++    NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, (LPARAM)raw);
++ }
++ 
++ 
++@@ -713,7 +714,7 @@ void macdrv_set_overlay_active(bool active)
++     for (i = 0; active && i < ARRAY_SIZE(buttons); i++)
++     {
++         if (NtUserGetAsyncKeyState(buttons[i].vkey) & 0x8000)
++-            send_mouse_input(NULL, NULL, buttons[i].up, 0, 0, buttons[i].data, FALSE, NtGetTickCount());
+++            send_mouse_input(NULL, NULL, buttons[i].up, 0, 0, buttons[i].data, FALSE, NtGetTickCount(), NULL);
++     }
++ }
++ 
++@@ -934,7 +935,7 @@ void macdrv_mouse_button(HWND hwnd, const macdrv_event *event)
++ 
++     send_mouse_input(hwnd, event->window, flags | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE,
++                      event->mouse_button.x, event->mouse_button.y,
++-                     data, FALSE, event->mouse_button.time_ms);
+++                     data, FALSE, event->mouse_button.time_ms, NULL);
++ }
++ 
++ 
++@@ -946,17 +947,25 @@ void macdrv_mouse_button(HWND hwnd, const macdrv_event *event)
++ void macdrv_mouse_moved(HWND hwnd, const macdrv_event *event)
++ {
++     UINT flags = MOUSEEVENTF_MOVE;
+++    struct raw_mouse raw = {0};
++ 
++-    TRACE("win %p/%p %s (%d,%d) drag %d time %lu (%lu ticks ago)\n", hwnd, event->window,
+++    TRACE("win %p/%p %s (%d,%d) raw (%d,%d) drag %d time %lu (%lu ticks ago)\n", hwnd, event->window,
++           (event->type == MOUSE_MOVED_RELATIVE) ? "relative" : "absolute",
++-          event->mouse_moved.x, event->mouse_moved.y, event->mouse_moved.drag,
++-          event->mouse_moved.time_ms, (NtGetTickCount() - event->mouse_moved.time_ms));
+++          event->mouse_moved.x, event->mouse_moved.y, event->mouse_moved.raw_x, event->mouse_moved.raw_y,
+++          event->mouse_moved.drag, event->mouse_moved.time_ms, (NtGetTickCount() - event->mouse_moved.time_ms));
++ 
++     if (event->type == MOUSE_MOVED_ABSOLUTE)
++         flags |= MOUSEEVENTF_ABSOLUTE;
++ 
+++    if (event->mouse_moved.raw_x || event->mouse_moved.raw_y)
+++    {
+++        raw.count = 1;
+++        raw.data[0].x = event->mouse_moved.raw_x;
+++        raw.data[0].y = event->mouse_moved.raw_y;
+++    }
+++
++     send_mouse_input(hwnd, event->window, flags, event->mouse_moved.x, event->mouse_moved.y,
++-                     0, event->mouse_moved.drag, event->mouse_moved.time_ms);
+++                     0, event->mouse_moved.drag, event->mouse_moved.time_ms, &raw);
++ }
++ 
++ 
++@@ -975,11 +984,11 @@ void macdrv_mouse_scroll(HWND hwnd, const macdrv_event *event)
++     if (event->mouse_scroll.y_scroll)
++         send_mouse_input(hwnd, event->window, MOUSEEVENTF_WHEEL | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE,
++                          event->mouse_scroll.x, event->mouse_scroll.y,
++-                         event->mouse_scroll.y_scroll, FALSE, event->mouse_scroll.time_ms);
+++                         event->mouse_scroll.y_scroll, FALSE, event->mouse_scroll.time_ms, NULL);
++     if (event->mouse_scroll.x_scroll)
++         send_mouse_input(hwnd, event->window, MOUSEEVENTF_HWHEEL | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE,
++                          event->mouse_scroll.x, event->mouse_scroll.y,
++-                         event->mouse_scroll.x_scroll, FALSE, event->mouse_scroll.time_ms);
+++                         event->mouse_scroll.x_scroll, FALSE, event->mouse_scroll.time_ms, NULL);
++ }
++ 
++ 
++-- 
++2.54.0 (Apple Git-157)
++
+diff --git a/patches/wine/0048-winemac-Add-autorelease-pools-to-WineMetalSwapChain-.patch b/patches/wine/0048-winemac-Add-autorelease-pools-to-WineMetalSwapChain-.patch
+new file mode 100644
+index 0000000..c6b7f20
+--- /dev/null
++++ b/patches/wine/0048-winemac-Add-autorelease-pools-to-WineMetalSwapChain-.patch
+@@ -0,0 +1,55 @@
++From e93902d39c6a5dac3a82b7e550b10b283178e6de Mon Sep 17 00:00:00 2001
++From: Brendan Shanks <bshanks@codeweavers.com>
++Date: Mon, 28 Sep 2026 16:10:29 -0700
++Subject: [PATCH] winemac: Add autorelease pools to WineMetalSwapChain C
++ wrappers.
++
++(cherry picked from commit 1300ec99c7ed7461df1d400257aa83165faf0069)
++---
++ dlls/winemac.drv/cocoa_window.m | 12 ++++++++++++
++ 1 file changed, 12 insertions(+)
++
++diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
++index 111cceac00..62425f1a49 100644
++--- a/dlls/winemac.drv/cocoa_window.m
+++++ b/dlls/winemac.drv/cocoa_window.m
++@@ -3901,24 +3901,36 @@ - (void) dealloc
++ @end
++ 
++ id<WineMetalSwapChain> macdrv_create_view_swapchain(WineContentView *view)
+++{
+++@autoreleasepool
++ {
++     return [[MetalViewSwapChain alloc] initWithView:view];
++ }
+++}
++ 
++ id<WineMetalSwapChain> macdrv_create_offscreen_swapchain(void* hwnd, CGRect bounds)
+++{
+++@autoreleasepool
++ {
++     return [[CAContextSwapChain alloc] initWithHwnd:hwnd bounds:bounds];
++ }
+++}
++ 
++ CAMetalLayer *macdrv_swapchain_get_layer(id<WineMetalSwapChain> swapchain)
+++{
+++@autoreleasepool
++ {
++     return [swapchain layer];
++ }
+++}
++ 
++ void macdrv_destroy_swapchain(id<WineMetalSwapChain> swapchain)
+++{
+++@autoreleasepool
++ {
++     [swapchain release];
++ }
+++}
++ 
++ void macdrv_window_create_ca_layer_host_view(WineWindow *window, unsigned int context_id)
++ {
++-- 
++2.54.0 (Apple Git-157)
++
+diff --git a/patches/wine/0049-ntdll-Increase-the-threadpool-worker-timeout-to-60-s.patch b/patches/wine/0049-ntdll-Increase-the-threadpool-worker-timeout-to-60-s.patch
+new file mode 100644
+index 0000000..3b2d487
+--- /dev/null
++++ b/patches/wine/0049-ntdll-Increase-the-threadpool-worker-timeout-to-60-s.patch
+@@ -0,0 +1,33 @@
++From 27109549fc4a10de440998f9597cbbd6756f2d10 Mon Sep 17 00:00:00 2001
++From: Elizabeth Figura <zfigura@codeweavers.com>
++Date: Thu, 29 Oct 2026 14:35:58 -0500
++Subject: [PATCH] ntdll: Increase the threadpool worker timeout to 60 seconds.
++
++On Windows 10 it seems to be 67 seconds, but we'll use a less odd-looking value.
++
++This avoids an apparent bug with Denuvo visible in Dead Cells. If a thread exits
++at a certain point in time, it triggers a TLS callback which crashes due to
++incomplete decryption. In some environments, the 5 second timeout of a
++threadpool worker can frequently trigger this crash.
++
++(cherry picked from commit c37cb58e4c05d31ad3cec0112dc57fba68c1893e)
++---
++ dlls/ntdll/threadpool.c | 2 +-
++ 1 file changed, 1 insertion(+), 1 deletion(-)
++
++diff --git a/dlls/ntdll/threadpool.c b/dlls/ntdll/threadpool.c
++index b47a26775e..796338bf6f 100644
++--- a/dlls/ntdll/threadpool.c
+++++ b/dlls/ntdll/threadpool.c
++@@ -95,7 +95,7 @@ struct timer_queue
++  * Object-oriented thread pooling API
++  */
++ 
++-#define THREADPOOL_WORKER_TIMEOUT 5000
+++#define THREADPOOL_WORKER_TIMEOUT 60000
++ #define MAXIMUM_WAITQUEUE_OBJECTS (MAXIMUM_WAIT_OBJECTS - 1)
++ 
++ /* internal threadpool representation */
++-- 
++2.54.0 (Apple Git-157)
++
+diff --git a/patches/wine/0050-win32u-Reparent-a-window-a-CBT-hook-turns-into-a-chi.patch b/patches/wine/0050-win32u-Reparent-a-window-a-CBT-hook-turns-into-a-chi.patch
 new file mode 100644
 index 0000000..43f389e
 --- /dev/null
-+++ b/patches/wine/0030-win32u-Reparent-a-window-a-CBT-hook-turns-into-a-chi.patch
++++ b/patches/wine/0050-win32u-Reparent-a-window-a-CBT-hook-turns-into-a-chi.patch
 @@ -0,0 +1,106 @@
 +From 7511415c7e40529a3fe4bd06978b0cb93ffb9324 Mon Sep 17 00:00:00 2001
 +From: Alchemac <noreply@alchemac.invalid>

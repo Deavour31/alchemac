@@ -209,3 +209,72 @@ extension Session {
                         preparing: accurate ? migrating : migrationRuntime != nil)
     }
 }
+
+// MARK: Files dropped onto the library window
+
+/// What to do with what the user dropped: one local EXE goes on to the install / register choice, anything else is refused with a plain reason.
+enum DropInput: Equatable {
+    case exe(URL)
+    case rejected(String)
+
+    /// `busy`: the name of what holds the library (a task, an update), nil when idle.
+    static func classify(urls: [URL], isDirectory: (URL) -> Bool, busy: String?) -> DropInput {
+        if let busy { return .rejected("\(busy) 중입니다. 끝난 뒤 다시 놓아 주세요.") }
+        guard let first = urls.first else { return .rejected("Windows 실행 파일(.exe)만 놓을 수 있습니다.") }
+        if urls.count > 1 { return .rejected("파일을 한 번에 하나씩 놓아 주세요.") }
+        guard first.isFileURL else { return .rejected("Windows 실행 파일(.exe)만 놓을 수 있습니다.") }
+        if isDirectory(first) { return .rejected("폴더 안에서 등록할 .exe 파일을 놓아 주세요.") }
+        switch first.pathExtension.lowercased() {
+        case "exe": return .exe(first)
+        case "lnk": return .rejected("Windows 바로가기(.lnk)는 지원하지 않습니다. 원본 .exe 파일을 놓아 주세요.")
+        case "msi": return .rejected("Windows 설치 패키지(.msi)는 지원하지 않습니다. 설치 파일(.exe)을 놓아 주세요.")
+        default: return .rejected("Windows 실행 파일(.exe)만 놓을 수 있습니다.")
+        }
+    }
+
+    static func overlayTitle(_ file: String) -> String { "‘\(file)’를 놓으면 설치 또는 등록을 선택합니다" }
+    static let overlayNote = "놓아도 바로 실행하지 않습니다"
+    static func choiceTitle(_ file: String) -> String { "‘\(file)’를 어떻게 할까요?" }
+    static let choiceText = "설치 프로그램이면 ‘설치 파일 실행’을, 이미 설치했거나 압축을 푼 프로그램이면 ‘프로그램 등록’을 고르세요."
+}
+
+// MARK: Update check status (Settings window)
+
+/// The result of the last update check, as one plain line.
+struct UpdateCheckStatus: Equatable {
+    enum Outcome: Equatable { case upToDate, available(String), needsSystem(String), failed(String), unknown }
+    var date: Date
+    var outcome: Outcome
+
+    var summary: String {
+        switch outcome {
+        case .upToDate: return "최신 버전입니다."
+        case .available(let version): return "새 버전 \(version)이 있습니다."
+        case .needsSystem(let version): return "새 버전이 있지만 macOS \(version) 이상이 필요합니다."
+        case .failed(let reason): return "확인하지 못했습니다: \(reason)"
+        case .unknown: return ""
+        }
+    }
+
+    /// `when` is the date already formatted ("오늘 오전 11:00").
+    func line(when: String) -> String { outcome == .unknown ? "마지막 확인: \(when)" : "\(when) 확인: \(summary)" }
+    static let never = "아직 업데이트를 확인하지 않았습니다."
+}
+
+// MARK: Wine environment rows (Management window)
+
+struct EnvironmentRow: Equatable {
+    var programs: Int
+    var running: Bool
+    var shared: Bool
+
+    /// Why the environment cannot be deleted right now; nil when it can. `lock` is the library lock's reason, if any.
+    func deleteReason(lock: String?) -> String? {
+        if shared { return "공용 Wine 환경은 삭제할 수 없습니다" }
+        if let lock { return lock }
+        if running { return "이 Wine 환경에서 프로그램이 실행 중입니다. 먼저 종료해 주세요" }
+        if programs > 0 { return "등록된 프로그램 \(programs)개가 쓰고 있습니다. 그 프로그램을 먼저 삭제하거나 목록에서 제거해 주세요" }
+        return nil
+    }
+    var programsText: String { "프로그램 \(programs)개" }
+}

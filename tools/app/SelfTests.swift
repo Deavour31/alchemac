@@ -1183,6 +1183,36 @@ struct SelfTests {
             try check(quit.contains("업데이트 전 상태로 복원") && !QuitSummary.text(sessions: [snap(shared, "a", "A")], place: { _ in "공용 Wine 환경" }, migrating: false).contains("복원")
                       && QuitSummary.title == "실행 중인 프로그램을 모두 종료하고 Alchemac을 종료할까요?" && QuitSummary.confirmButton == "모두 종료하고 Alchemac 종료", "the environment-update warning appears only while one is running")
         }
+
+        // UI 2-B: dropped files, update status, environment rows.
+        do {
+            let none: (URL) -> Bool = { _ in false }
+            let exe = URL(fileURLWithPath: "/tmp/Setup.EXE")
+            try check(DropInput.classify(urls: [exe], isDirectory: none, busy: nil) == .exe(exe), "one local EXE is accepted (any letter case)")
+            func reason(_ input: DropInput) -> String { if case .rejected(let text) = input { return text }; return "" }
+            try check(reason(DropInput.classify(urls: [exe, exe], isDirectory: none, busy: nil)) == "파일을 한 번에 하나씩 놓아 주세요.", "several files are refused")
+            try check(reason(DropInput.classify(urls: [URL(fileURLWithPath: "/tmp/dir")], isDirectory: { _ in true }, busy: nil)) == "폴더 안에서 등록할 .exe 파일을 놓아 주세요.", "a folder is refused")
+            try check(reason(DropInput.classify(urls: [URL(fileURLWithPath: "/tmp/a.lnk")], isDirectory: none, busy: nil)).contains(".lnk"), "a shortcut is refused")
+            try check(reason(DropInput.classify(urls: [URL(fileURLWithPath: "/tmp/a.MSI")], isDirectory: none, busy: nil)).contains(".msi"), "an MSI package is refused")
+            try check(reason(DropInput.classify(urls: [URL(fileURLWithPath: "/tmp/a.txt")], isDirectory: none, busy: nil)) == "Windows 실행 파일(.exe)만 놓을 수 있습니다.", "other files are refused")
+            try check(reason(DropInput.classify(urls: [], isDirectory: none, busy: nil)) == "Windows 실행 파일(.exe)만 놓을 수 있습니다.", "nothing usable is refused")
+            try check(reason(DropInput.classify(urls: [URL(string: "https://example.com/a.exe")!], isDirectory: none, busy: nil)) == "Windows 실행 파일(.exe)만 놓을 수 있습니다.", "a non-file URL is refused")
+            try check(DropInput.classify(urls: [exe], isDirectory: none, busy: "프로그램 등록") == .rejected("프로그램 등록 중입니다. 끝난 뒤 다시 놓아 주세요."), "the library lock refuses a drop and names the task")
+            try check(DropInput.classify(urls: [exe, exe], isDirectory: none, busy: "업데이트") == .rejected("업데이트 중입니다. 끝난 뒤 다시 놓아 주세요."), "the lock is reported before anything else")
+            try check(DropInput.choiceTitle("a.exe") == "‘a.exe’를 어떻게 할까요?" && DropInput.overlayTitle("a.exe").contains("설치 또는 등록") && DropInput.overlayNote.contains("바로 실행하지 않습니다"), "drop wording")
+
+            let day = Date()
+            try check(UpdateCheckStatus(date: day, outcome: .upToDate).line(when: "오늘 오전 11:00") == "오늘 오전 11:00 확인: 최신 버전입니다.", "status: up to date")
+            try check(UpdateCheckStatus(date: day, outcome: .available("0.5.20")).line(when: "오늘") == "오늘 확인: 새 버전 0.5.20이 있습니다.", "status: new version")
+            try check(UpdateCheckStatus(date: day, outcome: .failed("네트워크 오류")).line(when: "오늘").hasSuffix("확인하지 못했습니다: 네트워크 오류"), "status: failure reason")
+            try check(UpdateCheckStatus(date: day, outcome: .needsSystem("28")).summary.contains("macOS 28") && UpdateCheckStatus(date: day, outcome: .unknown).line(when: "어제") == "마지막 확인: 어제", "status: system requirement and unknown result")
+
+            try check(EnvironmentRow(programs: 0, running: false, shared: true).deleteReason(lock: nil) == "공용 Wine 환경은 삭제할 수 없습니다", "the shared environment cannot be deleted")
+            try check(EnvironmentRow(programs: 0, running: false, shared: false).deleteReason(lock: nil) == nil, "an unused dedicated environment can be deleted")
+            try check(EnvironmentRow(programs: 2, running: false, shared: false).deleteReason(lock: nil)?.contains("2개") == true, "an environment in use by programs cannot be deleted")
+            try check(EnvironmentRow(programs: 0, running: true, shared: false).deleteReason(lock: nil)?.contains("실행 중") == true, "a running environment cannot be deleted")
+            try check(EnvironmentRow(programs: 0, running: false, shared: false).deleteReason(lock: "업데이트를 준비하는 중입니다") == "업데이트를 준비하는 중입니다" && EnvironmentRow(programs: 3, running: false, shared: false).programsText == "프로그램 3개", "the library lock disables deleting")
+        }
         print("RESULT: \(passed) checks passed")
     }
 }

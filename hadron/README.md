@@ -30,12 +30,25 @@ Alchemac runs on the Hadron runtime, release 0.3.0
   `tools/runtime/build-mtld3d-d3d9.sh` and put them into a runtime with
   `tools/runtime/patch-mtld3d-d3d9.py [--i386 <i386-d3d9.dll>] <runtime> <new-runtime> d3d9.dll <patch>...`
   (`mtld3d.dll` and `mtld3d.so` are not rebuilt).
-- `patches/wine/0030-…`: Wine's `win32u` now makes a window a real child of its parent when a
+- `patches/wine/0050-…`: Wine's `win32u` now makes a window a real child of its parent when a
   `WH_CBT` hook turns an owned top-level window into a child while it is being created
   (as MFC dialogs do), like Windows. Before, the window stayed top-level with `WS_CHILD` set and
   the coordinates the program computed were wrong, so nested dialogs collapsed or were
   misplaced. Rebuild `win32u.so` from the Wine tree and put it into a runtime with
   `tools/runtime/patch-wine-unix-lib.py <runtime> <new-runtime> win32u.so <patch>...`.
+- `patches/wine/0034-…` to `0049-…` (except 0037, 0043, 0045 and 0046) and `patches/fex/0007-…`:
+  fixes taken from later Hadron releases, unchanged: freeing and reserving memory correctly in
+  emulated processes (`MEM_DECOMMIT`/`MEM_RELEASE`, neighbouring pages, top-down allocations
+  above 4 GB), loading images with shared sections, recovering from repeated stack overflows,
+  IME detection, no visible window while `wineboot` updates a prefix, three Retina-mode fixes,
+  a Metal swap chain leak, a thread-pool timeout, and a FEX crash in CPUID handling. 0043 and
+  0046 are left out because they change the signed `wine` loader or switch the OpenGL renderer;
+  0037 and 0045 change default display behaviour.
+- Wine and FEX libraries rebuilt from these trees are put into a runtime with
+  `tools/runtime/patch-runtime-files.py <runtime> <new-runtime> --file <built-file> <runtime-relative-path>... --patch <patch>...`.
+  It strips build paths, checks each file's architecture against the one it replaces, never
+  touches a file inside an `.app` bundle, and records the change in `RUNTIME-PATCH.json` and
+  `BUILD-LINEAGE.json`.
 
 Apply with `git -C hadron apply alchemac-hadron.patch`, then build the runtime as Hadron
 documents. Hadron and each component keep their own licenses.
