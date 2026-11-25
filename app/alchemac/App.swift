@@ -62,6 +62,8 @@ final class LibraryModel: ObservableObject {
     @Published var environmentNames: [String] = [""]
     /// Retina mode per Wine prefix path: shared, dedicated and programs' own prefixes.
     @Published var retina: [String: Bool] = [:]
+    /// The display choice (default, Retina, MetalFX upscale) per Wine prefix path.
+    @Published var displays: [String: LauncherStore.DisplayChoice] = [:]
 
     init(store: LauncherStore) throws {
         self.store = store; registry = try store.read(); refreshRetina(); refreshAddons()
@@ -117,15 +119,21 @@ final class LibraryModel: ObservableObject {
     }
     func refreshRetina() {
         environmentNames = [""] + store.environments()
-        var states: [String: Bool] = [:]
+        var states: [String: Bool] = [:], choices: [String: LauncherStore.DisplayChoice] = [:]
         var prefixes = environmentNames.map { store.prefix(environment: $0.isEmpty ? nil : $0) }
         prefixes += registry.launchers.filter(\.privatePrefix).compactMap { try? store.prefix($0) }
-        for prefix in prefixes { states[prefix.standardizedFileURL.path] = store.retinaEnabled(prefix: prefix) }
-        retina = states
+        for prefix in prefixes {
+            let choice = store.displayChoice(prefix: prefix)
+            choices[prefix.standardizedFileURL.path] = choice; states[prefix.standardizedFileURL.path] = choice == .retina
+        }
+        retina = states; displays = choices
     }
     func retinaOn(prefix: URL) -> Bool { retina[prefix.standardizedFileURL.path] == true }
     func retinaOn(environment: String?) -> Bool { retinaOn(prefix: store.prefix(environment: environment)) }
     func retinaOn(_ launcher: Launcher) -> Bool { (try? store.prefix(launcher)).map(retinaOn(prefix:)) ?? false }
+    func display(prefix: URL) -> LauncherStore.DisplayChoice { displays[prefix.standardizedFileURL.path] ?? .standard }
+    func display(environment: String?) -> LauncherStore.DisplayChoice { display(prefix: store.prefix(environment: environment)) }
+    func display(_ launcher: Launcher) -> LauncherStore.DisplayChoice { (try? store.prefix(launcher)).map(display(prefix:)) ?? .standard }
     func place(_ environment: String?) -> String { environment.map { "전용 Wine 환경 ‘\($0)’" } ?? "공용 Wine 환경" }
     func place(_ launcher: Launcher) -> String { launcher.privatePrefix ? "‘\(launcher.name)’ 전용 Wine 환경" : place(launcher.environment) }
     /// The plain name of the Wine environment at a prefix path (a session's), by comparing with the known ones.
@@ -136,33 +144,41 @@ final class LibraryModel: ObservableObject {
         if let owner = registry.launchers.first(where: { $0.privatePrefix && (try? store.prefix($0)).map(same) == true }) { return place(owner) }
         return "Wine 환경"
     }
-    func toggleRetina(environment: String?) { toggleRetina(prefix: store.prefix(environment: environment), place: place(environment)) }
-    func toggleRetina(id: String) {
+    /// Picks a display choice; picking the one already active returns to the default.
+    func choose(_ choice: LauncherStore.DisplayChoice, environment: String?) { choose(choice, prefix: store.prefix(environment: environment), place: place(environment)) }
+    func choose(_ choice: LauncherStore.DisplayChoice, id: String) {
         guard let launcher = launcher(id: id), let prefix = try? store.prefix(launcher) else { return }
         let can = availability(for: launcher)
         guard can.canToggleRetina else { if let reason = can.retinaReason { session.message = reason }; return }
-        toggleRetina(prefix: prefix, place: place(launcher))
+        choose(choice, prefix: prefix, place: place(launcher))
     }
-    func toggleRetina() { if let id = registry.selectedID { toggleRetina(id: id) } }
-    func toggleRetina(prefix: URL, place: String) {
+    func choose(_ choice: LauncherStore.DisplayChoice) { if let id = registry.selectedID { choose(choice, id: id) } }
+    func choose(_ choice: LauncherStore.DisplayChoice, prefix: URL, place: String) {
         guard FileManager.default.fileExists(atPath: prefix.appendingPathComponent("system.reg").path) else {
             self.error(AlchemacError.message("이 Wine 환경이 아직 만들어지지 않았습니다(\(place)). 프로그램을 한 번 실행한 뒤 다시 시도해 주세요.")); return
         }
-        applyRetina(!retinaOn(prefix: prefix), prefix: prefix, place: place) { _ in }
+        applyDisplay(display(prefix: prefix) == choice ? .standard : choice, prefix: prefix, place: place) { _ in }
     }
-    /// Switches a prefix's Retina mode with regedit; creates the environment if it is new.
+    static func displayName(_ choice: LauncherStore.DisplayChoice) -> String {
+        switch choice { case .standard: return "기본"; case .retina: return "선명한 화면(Retina)"; case .metalFX: return "성능 우선(MetalFX 업스케일)" }
+    }
+    /// Switches a prefix to a display choice with regedit; creates the environment if it is new.
     func applyRetina(_ on: Bool, prefix: URL, place: String, then: @escaping (Bool) -> Void) {
+        applyDisplay(on ? .retina : .standard, prefix: prefix, place: place, then: then)
+    }
+    func applyDisplay(_ choice: LauncherStore.DisplayChoice, prefix: URL, place: String, then: @escaping (Bool) -> Void) {
         var script: URL?
         do {
-            let file = try store.registryScript(LauncherStore.retinaRegistry(on: on))
+            let file = try store.registryScript(store.displayRegistry(choice, prefix: prefix))
             script = file
-            try session.applyRegistry(file, prefix: prefix, title: place + (on ? " 선명한 화면 켜기" : " 선명한 화면 끄기"), store: store) { [weak self] in
+            let name = Self.displayName(choice)
+            try session.applyRegistry(file, prefix: prefix, title: place + " 화면 설정: " + name, store: store) { [weak self] in
                 try? FileManager.default.removeItem(at: file)
                 guard let self else { return }
                 self.refreshRetina()
-                let ok = self.retinaOn(prefix: prefix) == on
+                let ok = self.display(prefix: prefix) == choice
                 self.session.message += ok
-                    ? "\n\(place)의 선명한 화면을 \(on ? "켰습니다" : "껐습니다"). 다음에 실행하는 프로그램부터 적용됩니다."
+                    ? "\n\(place)의 화면 설정을 ‘\(name)’(으)로 바꿨습니다. 다음에 실행하는 프로그램부터 적용됩니다."
                     : "\n설정이 적용되지 않았습니다. 진단 로그를 확인해 주세요."
                 then(ok)
             }
@@ -1110,7 +1126,7 @@ struct LibraryView: View {
                 .task(id: launcher.id + launcher.executable) { await model.loadIcon(launcher) }
             VStack(alignment: .leading, spacing: 4) {
                 Text(launcher.name).font(.headline)
-                Text(launcher.detail + (model.retinaOn(launcher) ? " · 선명한 화면" : "") + (launcher.scaled ? " · 크기 보정" : ""))
+                Text(launcher.detail + (model.display(launcher) == .retina ? " · 선명한 화면" : model.display(launcher) == .metalFX ? " · MetalFX 업스케일" : "") + (launcher.scaled ? " · 크기 보정" : ""))
                     .font(.caption).foregroundStyle(.secondary)
                 if let other = status.sharedWith {
                     Text(RowStatus.sharedText(other)).font(.caption).foregroundStyle(.secondary)
@@ -1127,6 +1143,7 @@ struct LibraryView: View {
         .tag(launcher.id)
     }
 
+    static let metalFXHelp = "낮은 해상도로 그린 뒤 Apple MetalFX로 Retina 크기로 키웁니다. 프레임은 오르고 글자는 Retina보다 조금 부드럽습니다. Direct3D 11 게임에만 적용됩니다."
     /// The menu of the right-clicked row (not of the selection), built from the same availability as the buttons.
     @ViewBuilder private func rowMenu(_ launcher: Launcher) -> some View {
         let can = model.availability(for: launcher)
@@ -1149,8 +1166,11 @@ struct LibraryView: View {
                 Button(launcher.scaled ? "크기 보정 끄기" : "크기 보정 켜기") { model.toggleScaled(id: id) }.disabled(!can.canToggleScaled)
             }
             Section("같은 Wine 환경의 모든 프로그램에 적용") {
-                Button(model.retinaOn(launcher) ? "선명한 화면(Retina) 끄기" : "선명한 화면(Retina) 켜기") { model.toggleRetina(id: id) }
+                let shown = model.display(launcher)
+                Toggle("선명한 화면(Retina)", isOn: Binding(get: { shown == .retina }, set: { _ in model.choose(.retina, id: id) }))
                     .disabled(!can.canToggleRetina).help(can.retinaReason ?? "")
+                Toggle("성능 우선(MetalFX 업스케일)", isOn: Binding(get: { shown == .metalFX }, set: { _ in model.choose(.metalFX, id: id) }))
+                    .disabled(!can.canToggleRetina).help(can.retinaReason ?? Self.metalFXHelp)
                 if let reason = can.retinaReason { Text(reason) }
             }
         }
@@ -1383,7 +1403,7 @@ struct ManagementView: View {
     @ViewBuilder private func environmentRow(_ key: String) -> some View {
         let environment: String? = key.isEmpty ? nil : key
         let info = model.environmentRow(environment)
-        let sharp = model.retinaOn(environment: environment)
+        let shown = model.display(environment: environment)
         let lock = model.lockReason
         let deleteReason = info.deleteReason(lock: lock)
         HStack(spacing: 10) {
@@ -1392,14 +1412,19 @@ struct ManagementView: View {
                 HStack(spacing: 8) {
                     Text(info.programsText)
                     if info.running { Text("실행 중").foregroundStyle(Color.teal) }
-                    Text(sharp ? "선명한 화면 켜짐" : "선명한 화면 꺼짐")
+                    Text("화면: " + (shown == .retina ? "Retina" : shown == .metalFX ? "MetalFX" : "기본"))
                 }.font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
             Button("폴더 열기") { model.revealEnvironment(environment) }
-            Button(sharp ? "선명한 화면 끄기" : "선명한 화면(Retina) 켜기") { model.toggleRetina(environment: environment) }
+            Toggle("선명한 화면(Retina)", isOn: Binding(get: { shown == .retina }, set: { _ in model.choose(.retina, environment: environment) }))
+                .toggleStyle(.button)
                 .disabled(model.locked || info.running)
                 .help(model.lockReason ?? (info.running ? ProgramAvailability.retinaBusyReason : "선명한 화면(Retina)은 이 Wine 환경의 모든 프로그램에 적용됩니다"))
+            Toggle("성능 우선(MetalFX 업스케일)", isOn: Binding(get: { shown == .metalFX }, set: { _ in model.choose(.metalFX, environment: environment) }))
+                .toggleStyle(.button)
+                .disabled(model.locked || info.running)
+                .help(model.lockReason ?? (info.running ? ProgramAvailability.retinaBusyReason : LibraryView.metalFXHelp))
             if let name = environment {
                 Button("환경 삭제…") { model.deleteEnvironment(name) }.disabled(deleteReason != nil).help(deleteReason ?? "")
             } else {
@@ -1581,7 +1606,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     @objc func menuReveal(_ sender: Any?) { model?.revealGame() }
     @objc func menuRename(_ sender: Any?) { model?.rename() }
     @objc func menuToggleScaled(_ sender: Any?) { model?.toggleScaled() }
-    @objc func menuToggleRetina(_ sender: Any?) { model?.toggleRetina() }
+    @objc func menuToggleRetina(_ sender: Any?) { model?.choose(.retina) }
+    @objc func menuToggleMetalFX(_ sender: Any?) { model?.choose(.metalFX) }
     @objc func menuRemove(_ sender: Any?) { model?.remove() }
     @objc func menuDelete(_ sender: Any?) { model?.deleteProgram() }
     @objc func menuManagement(_ sender: Any?) { showManagement(.environments) }
@@ -1613,7 +1639,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             if let t = target { item.title = t.launcher.scaled ? "크기 보정 끄기" : "크기 보정 켜기 (작게 보일 때)" }
             return target?.can.canToggleScaled ?? false
         case #selector(menuToggleRetina(_:)):
-            if let t = target { item.title = model.retinaOn(t.launcher) ? "선명한 화면(Retina) 끄기" : "선명한 화면(Retina) 켜기" }
+            if let t = target { item.state = model.display(t.launcher) == .retina ? .on : .off }
+            return target?.can.canToggleRetina ?? false
+        case #selector(menuToggleMetalFX(_:)):
+            if let t = target { item.state = model.display(t.launcher) == .metalFX ? .on : .off }
             return target?.can.canToggleRetina ?? false
         default: return true
         }

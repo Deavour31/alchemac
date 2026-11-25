@@ -302,6 +302,22 @@ struct SelfTests {
         let scaledProcess = Process()
         try AlchemacRuntime.configure(scaledProcess, launcher: scaledCopy, store: store, runtime: mock, resources: resources)
         try check(scaledProcess.arguments?[2] == "--launch-scaled", "size correction starts the program DPI-scaled")
+        try check(DisplayModeSpec.parse("1960x1274")?.width == 1960 && DisplayModeSpec.parse("1960x1274")?.height == 1274, "display mode: a valid size parses")
+        try check(["", "1960", "1960x", "x1274", "1960x1274x2", "1960X1274", " 1960x1274", "1960x1274 ", "-1960x1274", "+1960x1274", "1961x1274", "1960x1275", "638x480", "8194x1000", "01960x1274", "٢٠٠٠x1274", "1960×1274", "1960x1274\n"].allSatisfy { DisplayModeSpec.parse($0) == nil }, "display mode: malformed or out-of-range sizes are rejected")
+        try check(DisplayModeSpec.parse("640x640") != nil && DisplayModeSpec.parse("8192x8192") != nil, "display mode: the limits are accepted")
+        var modeLauncher = copied; modeLauncher.displayMode = "1960x1274"
+        let modeProcess = Process()
+        try AlchemacRuntime.configure(modeProcess, launcher: modeLauncher, store: store, runtime: mock, resources: resources)
+        try check(Array(modeProcess.arguments?.suffix(2) ?? []) == ["--display-mode", "1960x1274"] && modeProcess.arguments?.count == 7, "display mode: passed to prefix-profile after the target")
+        try check(copiedProcess.arguments?.contains("--display-mode") == false, "display mode: absent by default")
+        var badModeLauncher = copied; badModeLauncher.displayMode = "1961x1274"
+        try check((try? badModeLauncher.validate()) == nil && (try? modeLauncher.validate()) != nil, "display mode: an invalid value is rejected by validation")
+        let oldJSON = Data("{\"id\":\"old-one\",\"name\":\"Old\",\"executable\":\"a/b.exe\"}".utf8)
+        let oldDecoded = try JSONDecoder().decode(Launcher.self, from: oldJSON)
+        try check(oldDecoded.displayMode == nil && !String(decoding: try JSONEncoder().encode(oldDecoded), as: UTF8.self).contains("displayMode"), "display mode: older launchers.json loads unchanged and stays without the field")
+        let newDecoded = try JSONDecoder().decode(Launcher.self, from: Data("{\"id\":\"new-one\",\"name\":\"New\",\"executable\":\"a/b.exe\",\"displayMode\":\"1960x1274\"}".utf8))
+        try check(newDecoded.displayMode == "1960x1274", "display mode: the field is read from launchers.json")
+
         try check(!store.retinaEnabled(environment: nil), "Retina mode reads as off without a Mac Driver key")
         try Data("WINE REGISTRY Version 2\n\n[Software\\\\Wine\\\\Mac Driver] 1792291078\n\"RetinaMode\"=\"y\"\n".utf8)
             .write(to: store.sharedPrefix.appendingPathComponent("user.reg"))
@@ -329,6 +345,43 @@ struct SelfTests {
         try check(ownPrefixProcess.environment?["WINEPREFIX"] == (try store.prefix(imported)).path, "a program's own prefix can switch Retina mode too")
         try rejects("registry changes refused outside the library") { try AlchemacRuntime.configureRegistry(Process(), prefix: URL(fileURLWithPath: "/tmp/elsewhere"), script: script, store: store, runtime: mock, resources: resources) }
         try check(!store.retinaEnabled(prefix: store.prefix(imported)), "Retina state reads from any prefix")
+        // MetalFX upscaling (performance first).
+        let pair = LauncherStore.metalFXFactorKey
+        try check(LauncherStore.dxmtConfig(nil, factor: 2) == "\(pair)=2" && LauncherStore.dxmtConfig("", factor: 2) == "\(pair)=2", "MetalFX config: added when there is none")
+        try check(LauncherStore.dxmtConfig("d3d11.maxFrameLatency=1", factor: 2) == "d3d11.maxFrameLatency=1;\(pair)=2", "MetalFX config: other pairs are kept, the factor is appended")
+        try check(LauncherStore.dxmtConfig("a=1;\(pair)=3;b=2", factor: 2) == "a=1;\(pair)=2;b=2", "MetalFX config: an existing factor is replaced in place")
+        try check(LauncherStore.dxmtConfig("a=1;\(pair)=2;b=2", factor: nil) == "a=1;b=2" && LauncherStore.dxmtConfig("\(pair)=2", factor: nil) == nil && LauncherStore.dxmtConfig(nil, factor: nil) == nil,
+                  "MetalFX config: removing keeps other pairs and yields nothing when empty")
+        try check(LauncherStore.dxmtConfig(" a=1 ; ;\(pair)=2;\(pair)=3", factor: 2) == "a=1;\(pair)=2", "MetalFX config: blanks and duplicate factors are tidied")
+        try check(LauncherStore.upscaleFactor(config: "x=1;\(pair)=2") == 2 && LauncherStore.upscaleFactor(config: "x=1") == nil && LauncherStore.upscaleFactor(config: nil) == nil, "MetalFX config: the factor is read")
+        func userReg(_ lines: String...) -> String { "WINE REGISTRY Version 2\n\n" + lines.joined(separator: "\n") + "\n" }
+        let envOn = userReg("[Environment] 1792291078", "\"DXMT_CONFIG\"=\"\(pair)=2\"", "\"DXMT_METALFX_SPATIAL_SWAPCHAIN\"=\"1\"")
+        try check(LauncherStore.displayChoice(userReg: envOn) == .metalFX && LauncherStore.displayChoice(userReg: nil) == .standard && LauncherStore.displayChoice(userReg: "") == .standard,
+                  "display choice: MetalFX is read from the environment values, absent means default")
+        try check(LauncherStore.displayChoice(userReg: userReg("[Environment] 1", "\"DXMT_METALFX_SPATIAL_SWAPCHAIN\"=\"1\"")) == .standard
+                  && LauncherStore.displayChoice(userReg: userReg("[Environment] 1", "\"DXMT_CONFIG\"=\"\(pair)=2\"")) == .standard
+                  && LauncherStore.displayChoice(userReg: userReg("[Environment] 1", "\"DXMT_METALFX_SPATIAL_SWAPCHAIN\"=\"0\"", "\"DXMT_CONFIG\"=\"\(pair)=2\"")) == .standard
+                  && LauncherStore.displayChoice(userReg: userReg("[Other] 1", "\"DXMT_METALFX_SPATIAL_SWAPCHAIN\"=\"1\"", "\"DXMT_CONFIG\"=\"\(pair)=2\"")) == .standard,
+                  "display choice: needs both values, the switch set to 1, in the Environment key")
+        try check(LauncherStore.displayChoice(userReg: userReg("[Software\\\\Wine\\\\Mac Driver] 1", "\"RetinaMode\"=\"y\"", "", "[Environment] 1", "\"DXMT_CONFIG\"=\"\(pair)=2\"", "\"DXMT_METALFX_SPATIAL_SWAPCHAIN\"=\"1\"")) == .retina
+                  && LauncherStore.displayChoice(userReg: userReg("[Software\\\\Wine\\\\Mac Driver] 1", "\"RetinaMode\"=\"n\"")) == .standard, "display choice: Retina is read from the Mac Driver key and wins")
+        let toMetal = LauncherStore.displayRegistry(.metalFX, userReg: nil)
+        try check(toMetal.contains(#""RetinaMode"="n""#) && toMetal.contains("dword:00000060") && toMetal.contains("@=-")
+                  && toMetal.contains("[HKEY_CURRENT_USER\\Environment]\r\n\"DXMT_METALFX_SPATIAL_SWAPCHAIN\"=\"1\"\r\n\"DXMT_CONFIG\"=\"\(pair)=2\"\r\n"),
+                  "MetalFX on: Retina off settings plus the two environment values")
+        let toMetalKeep = LauncherStore.displayRegistry(.metalFX, userReg: userReg("[Environment] 1", "\"DXMT_CONFIG\"=\"d3d11.maxFrameLatency=1\""))
+        try check(toMetalKeep.contains("\"DXMT_CONFIG\"=\"d3d11.maxFrameLatency=1;\(pair)=2\""), "MetalFX on keeps the environment's other config pairs")
+        let toRetina = LauncherStore.displayRegistry(.retina, userReg: envOn)
+        try check(toRetina.contains(#""RetinaMode"="y""#) && toRetina.contains("\"DXMT_METALFX_SPATIAL_SWAPCHAIN\"=-") && toRetina.contains("\"DXMT_CONFIG\"=-"), "Retina on removes the MetalFX values")
+        let toRetinaKeep = LauncherStore.displayRegistry(.retina, userReg: userReg("[Environment] 1", "\"DXMT_CONFIG\"=\"a=1;\(pair)=2\"", "\"DXMT_METALFX_SPATIAL_SWAPCHAIN\"=\"1\""))
+        try check(toRetinaKeep.contains("\"DXMT_CONFIG\"=\"a=1\"") && toRetinaKeep.contains("\"DXMT_METALFX_SPATIAL_SWAPCHAIN\"=-"), "removing MetalFX keeps other config pairs")
+        let toStandard = LauncherStore.displayRegistry(.standard, userReg: envOn)
+        try check(toStandard.contains(#""RetinaMode"="n""#) && toStandard.contains("\"DXMT_METALFX_SPATIAL_SWAPCHAIN\"=-"), "default removes MetalFX values")
+        try check(!LauncherStore.displayRegistry(.standard, userReg: userReg("[Environment] 1", "\"PATH\"=\"x\"")).contains("Environment]")
+                  && LauncherStore.displayRegistry(.retina, userReg: nil) == LauncherStore.retinaRegistry(on: true)
+                  && LauncherStore.displayRegistry(.standard, userReg: nil) == off, "no environment changes when there is no MetalFX value to remove")
+        try check(LauncherStore.displayRegistry(.metalFX, userReg: userReg("[Environment] 1", "\"DXMT_CONFIG\"=\"a=\\\"q\\\\\\\\p\\\"\"")).contains("\"DXMT_CONFIG\"=\"a=\\\"q\\\\\\\\p\\\";\(pair)=2\""),
+                  "quotes and backslashes in a kept config survive the round trip")
         // Concurrent sessions, one per Wine prefix, against a supervisor stand-in that waits for TERM.
         let bundle = temp.appendingPathComponent("Fixture.app/Contents")
         let slow = bundle.appendingPathComponent("SharedSupport/runtime")
@@ -1212,6 +1265,29 @@ struct SelfTests {
             try check(EnvironmentRow(programs: 2, running: false, shared: false).deleteReason(lock: nil)?.contains("2개") == true, "an environment in use by programs cannot be deleted")
             try check(EnvironmentRow(programs: 0, running: true, shared: false).deleteReason(lock: nil)?.contains("실행 중") == true, "a running environment cannot be deleted")
             try check(EnvironmentRow(programs: 0, running: false, shared: false).deleteReason(lock: "업데이트를 준비하는 중입니다") == "업데이트를 준비하는 중입니다" && EnvironmentRow(programs: 3, running: false, shared: false).programsText == "프로그램 3개", "the library lock disables deleting")
+
+            let plistText = Data("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>CFBundleName</key><string>Game</string><key>LSUIElement</key><true/></dict></plist>".utf8)
+            if case .changed(let output) = GameModeCategory.updated(plist: plistText), let dict = try PropertyListSerialization.propertyList(from: output, options: [], format: nil) as? [String: Any] {
+                try check(dict["LSApplicationCategoryType"] as? String == "public.app-category.games", "game mode: the games category is added when missing")
+                try check(dict["CFBundleName"] as? String == "Game" && dict["LSUIElement"] as? Bool == true && dict.count == 3, "game mode: other keys are preserved")
+                try check(GameModeCategory.updated(plist: output) == .unchanged, "game mode: a second pass changes nothing")
+            } else { try check(false, "game mode: a plist without the key is changed") }
+            let custom = Data("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>LSApplicationCategoryType</key><string>public.app-category.utilities</string></dict></plist>".utf8)
+            try check(GameModeCategory.updated(plist: custom) == .unchanged, "game mode: an existing value is left alone")
+            let arrayPlist = Data("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><array><string>x</string></array></plist>".utf8)
+            try check(GameModeCategory.updated(plist: arrayPlist) == .rejected && GameModeCategory.updated(plist: Data("not a plist".utf8)) == .rejected, "game mode: a non-dictionary plist is rejected")
+            let gameScope = temp.appendingPathComponent("gm-scope", isDirectory: true)
+            let gameApp = gameScope.appendingPathComponent("apps/x/Game.app", isDirectory: true)
+            try fm.createDirectory(at: gameApp.appendingPathComponent("Contents"), withIntermediateDirectories: true)
+            let gamePlist = gameApp.appendingPathComponent("Contents/Info.plist")
+            let outside = temp.appendingPathComponent("gm-outside.plist")
+            try plistText.write(to: outside)
+            try fm.createSymbolicLink(at: gamePlist, withDestinationURL: outside)
+            try check(!AlchemacRuntime.markAsGame(bundle: gameApp, scope: gameScope) && (try Data(contentsOf: outside)) == plistText, "game mode: a linked Info.plist is refused and its target untouched")
+            try fm.removeItem(at: gamePlist)
+            try plistText.write(to: gamePlist)
+            try check(AlchemacRuntime.markAsGame(bundle: gameApp, scope: gameScope) && GameModeCategory.updated(plist: try Data(contentsOf: gamePlist)) == .unchanged, "game mode: a real Info.plist inside the scope gets the category")
+            try check(!AlchemacRuntime.markAsGame(bundle: gameApp, scope: temp.appendingPathComponent("elsewhere", isDirectory: true)), "game mode: a bundle outside the scope is refused")
         }
         print("RESULT: \(passed) checks passed")
     }

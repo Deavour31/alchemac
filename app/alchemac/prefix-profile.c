@@ -375,13 +375,67 @@ static void refresh_d3d9(void) {
     }
 }
 
+/* Optional "WxH" for --display-mode: 640..8192, both even, nothing else. */
+static BOOL parse_display_mode(const wchar_t *text, DWORD *width, DWORD *height) {
+    DWORD values[2] = {0, 0};
+    const wchar_t *c = text;
+    for (int part = 0; part < 2; part++) {
+        int digits = 0;
+        while (*c >= L'0' && *c <= L'9') {
+            if (++digits > 4) return FALSE;
+            values[part] = values[part] * 10 + (DWORD)(*c - L'0'); c++;
+        }
+        if (!digits || (*c != (part ? 0 : L'x'))) return FALSE;
+        if (part == 0) c++;
+    }
+    for (int i = 0; i < 2; i++) if (values[i] < 640 || values[i] > 8192 || (values[i] & 1)) return FALSE;
+    *width = values[0]; *height = values[1];
+    return TRUE;
+}
+
+/* Changes the primary display's size for this Wine session only, before the target starts. Flags 0, not
+ * CDS_UPDATEREGISTRY (nothing is written to the prefix) and not CDS_FULLSCREEN (Wine's explorer would then
+ * restore the mode as soon as this helper exits, but the launcher's own children need it). The mode lives in
+ * the wineserver session and is gone when the session ends. Only a mode EnumDisplaySettingsW lists is
+ * accepted; otherwise the nearest ones are logged and the launch continues unchanged. */
+static void apply_display_mode(DWORD width, DWORD height) {
+    DEVMODEW current = {0}; current.dmSize = sizeof(current);
+    if (!EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &current)) {
+        printf("prefix-profile: display mode %lux%lu skipped, current mode unavailable (Win32 %lu)\n", width, height, GetLastError());
+        return;
+    }
+    DEVMODEW found = {0}; BOOL have = FALSE;
+    DEVMODEW near1 = {0}, near2 = {0}; double d1 = 1e18, d2 = 1e18;
+    for (DWORD i = 0;; i++) {
+        DEVMODEW mode = {0}; mode.dmSize = sizeof(mode);
+        if (!EnumDisplaySettingsW(NULL, i, &mode)) break;
+        if (mode.dmPelsWidth == width && mode.dmPelsHeight == height && mode.dmBitsPerPel == current.dmBitsPerPel
+                && mode.dmDisplayFrequency == current.dmDisplayFrequency) { found = mode; have = TRUE; break; }
+        double dw = (double)mode.dmPelsWidth - width, dh = (double)mode.dmPelsHeight - height, d = dw * dw + dh * dh;
+        if (d < d1) { near2 = near1; d2 = d1; near1 = mode; d1 = d; }
+        else if (d < d2 && (mode.dmPelsWidth != near1.dmPelsWidth || mode.dmPelsHeight != near1.dmPelsHeight)) { near2 = mode; d2 = d; }
+    }
+    if (!have) {
+        printf("prefix-profile: display mode %lux%lu is not listed, unchanged (current %lux%lu@%lu, nearest %lux%lu, %lux%lu)\n",
+               width, height, current.dmPelsWidth, current.dmPelsHeight, current.dmDisplayFrequency,
+               near1.dmPelsWidth, near1.dmPelsHeight, near2.dmPelsWidth, near2.dmPelsHeight);
+        return;
+    }
+    found.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY;
+    LONG result = ChangeDisplaySettingsExW(NULL, &found, NULL, 0, NULL);
+    DEVMODEW after = {0}; after.dmSize = sizeof(after);
+    EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &after);
+    printf("prefix-profile: display mode %lux%lu@%lu requested from %lux%lu, result=%ld, now %lux%lu\n", width, height,
+           found.dmDisplayFrequency, current.dmPelsWidth, current.dmPelsHeight, (long)result, after.dmPelsWidth, after.dmPelsHeight);
+}
+
 int wmain(int argc, wchar_t **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     /* --launch keeps the program's own DPI awareness, --launch-scaled has Wine scale it,
      * --setup leaves it to the environment default (installers and their helpers). */
     if (argc < 3 || (wcscmp(argv[1], L"--check") && wcscmp(argv[1], L"--launch") && wcscmp(argv[1], L"--launch-scaled")
             && wcscmp(argv[1], L"--setup") && wcscmp(argv[1], L"--command"))) {
-        fprintf(stderr, "usage: prefix-profile.exe --check font.ttf | --launch|--launch-scaled|--setup font.ttf Program.exe | --command font.ttf \"command line\"\n");
+        fprintf(stderr, "usage: prefix-profile.exe --check font.ttf | --launch|--launch-scaled|--setup font.ttf Program.exe | --command font.ttf \"command line\" | [--launch|--launch-scaled font.ttf Program.exe --display-mode WxH]\n");
         return 2;
     }
     if (install_font(argv[2])) return 1;
@@ -408,7 +462,11 @@ int wmain(int argc, wchar_t **argv) {
         CloseHandle(child.hThread); CloseHandle(child.hProcess);
         return 0;
     }
-    if (argc != 4 || wcschr(argv[3], L'"')) return 2;
+    DWORD mode_width = 0, mode_height = 0;
+    if (argc == 6 && wcscmp(argv[1], L"--setup") && !wcscmp(argv[4], L"--display-mode")) {
+        if (!parse_display_mode(argv[5], &mode_width, &mode_height)) { fprintf(stderr, "prefix-profile: invalid --display-mode\n"); return 2; }
+    } else if (argc != 4) return 2;
+    if (wcschr(argv[3], L'"')) return 2;
     if (wcscmp(argv[1], L"--setup")) {
         set_dpi_override(argv[3], !wcscmp(argv[1], L"--launch-scaled"));
         set_folder_dpi_override(argv[3], !wcscmp(argv[1], L"--launch-scaled"));
@@ -416,6 +474,7 @@ int wmain(int argc, wchar_t **argv) {
     DWORD attributes = GetFileAttributesW(argv[3]);
     if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) return fail("launcher file");
     ensure_mono(argv[3]);
+    if (mode_width) apply_display_mode(mode_width, mode_height);
     size_t length = wcslen(argv[3]);
     wchar_t *command = HeapAlloc(GetProcessHeap(), 0, (length + 3) * sizeof(wchar_t));
     if (!command) return fail("command allocation");

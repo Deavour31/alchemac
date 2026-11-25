@@ -77,14 +77,19 @@ Alchemac runs on the Hadron runtime, release 0.3.0
   the coordinates the program computed were wrong, so nested dialogs collapsed or were
   misplaced. Rebuild `win32u.so` from the Wine tree and put it into a runtime with
   `tools/runtime/patch-wine-unix-lib.py <runtime> <new-runtime> win32u.so <patch>...`.
-- `patches/wine/0034-…` to `0049-…` (except 0037, 0043, 0045 and 0046) and `patches/fex/0007-…`:
+- `patches/wine/0030-…` to `0049-…` (except 0037, 0039, 0043, 0046 and 0047) and `patches/fex/0007-…`:
   fixes taken from later Hadron releases, unchanged: freeing and reserving memory correctly in
   emulated processes (`MEM_DECOMMIT`/`MEM_RELEASE`, neighbouring pages, top-down allocations
   above 4 GB), loading images with shared sections, recovering from repeated stack overflows,
-  IME detection, no visible window while `wineboot` updates a prefix, three Retina-mode fixes,
+  IME detection, no visible window while `wineboot` updates a prefix, a Retina-mode screen size fix,
   a Metal swap chain leak, a thread-pool timeout, and a FEX crash in CPUID handling. 0043 and
   0046 are left out because they change the signed `wine` loader or switch the OpenGL renderer;
-  0037 and 0045 change default display behaviour.
+  0037 changes the default Retina behaviour. 0030 to 0033 and 0045 are included: a program that
+  asks for another display mode now renders at that mode and its window is scaled to the display
+  (emulated mode changes, with the related multi-display fixes) instead of changing the real mode.
+  0039 and 0047 (Retina-mode cursor size and raw mouse movement in points) are kept in
+  `patches/wine-excluded/` and not applied: Alchemac combines RetinaMode with 192 DPI, where 0039
+  draws cursors at twice their size and 0047 halves raw mouse movement.
 - Wine and FEX libraries rebuilt from these trees are put into a runtime with
   `tools/runtime/patch-runtime-files.py <runtime> <new-runtime> --file <built-file> <runtime-relative-path>... --patch <patch>...`.
   It strips build paths, checks each file's architecture against the one it replaces, never

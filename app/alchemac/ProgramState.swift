@@ -278,3 +278,46 @@ struct EnvironmentRow: Equatable {
     }
     var programsText: String { "프로그램 \(programs)개" }
 }
+
+// MARK: Game Mode classification of the per-program bundle
+
+/// macOS turns Game Mode on only for an app whose Info.plist says it is a game. The bundle that the runtime's `play`
+/// script writes for the game window has no such key, so Alchemac adds it (the script itself is hash-locked).
+enum GameModeCategory {
+    static let key = "LSApplicationCategoryType"
+    static let value = "public.app-category.games"
+
+    enum Outcome: Equatable {
+        /// The plist with the key added; every other key is kept.
+        case changed(Data)
+        /// The key already has a value (any value is left alone).
+        case unchanged
+        /// Not a property list, or its top level is not a dictionary.
+        case rejected
+    }
+
+    static func updated(plist data: Data) -> Outcome {
+        guard let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
+              var dictionary = object as? [String: Any] else { return .rejected }
+        if dictionary[key] != nil { return .unchanged }
+        dictionary[key] = value
+        guard let output = try? PropertyListSerialization.data(fromPropertyList: dictionary, format: .xml, options: 0) else { return .rejected }
+        return .changed(output)
+    }
+}
+
+/// A per-program desktop size, "WxH" as in "1960x1274", that prefix-profile applies before the program starts.
+enum DisplayModeSpec {
+    /// Strict: ASCII digits only, no spaces or signs, each side 640...8192 and even. Anything else is nil.
+    static func parse(_ text: String) -> (width: Int, height: Int)? {
+        let parts = text.split(separator: "x", maxSplits: 2, omittingEmptySubsequences: false)
+        guard parts.count == 2 else { return nil }
+        var values: [Int] = []
+        for part in parts {
+            guard (1...4).contains(part.utf8.count), part.utf8.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }), let value = Int(part),
+                  (640...8192).contains(value), value % 2 == 0 else { return nil }
+            values.append(value)
+        }
+        return (values[0], values[1])
+    }
+}

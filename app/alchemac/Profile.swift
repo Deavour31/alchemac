@@ -22,6 +22,8 @@ struct Launcher: Codable, Identifiable, Hashable {
     var environment: String?
     /// Have Wine scale this program as DPI-unaware, for programs that draw too small in Retina mode.
     var scaled = false
+    /// "WxH" (see DisplayModeSpec): the desktop size the program sees for this session, set by editing launchers.json.
+    var displayMode: String?
     /// The add-on whose recipe this program was imported and runs with.
     var addon: String?
     /// A copied program with a Wine environment of its own, inside its library folder.
@@ -31,6 +33,7 @@ struct Launcher: Codable, Identifiable, Hashable {
         guard id.range(of: "^[a-z0-9-]{1,48}$", options: .regularExpression) != nil,
               Self.validExecutable(executable, kind: kind), !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               name.count <= 80, environment.map(Self.validEnvironment) ?? true,
+              displayMode.map({ DisplayModeSpec.parse($0) != nil }) ?? true,
               !privatePrefix || (kind == .copied && environment == nil),
               addon.map({ $0.range(of: "^[a-z0-9][a-z0-9-]{0,31}$", options: .regularExpression) != nil }) ?? true else {
             throw AlchemacError.message("프로그램 등록 정보를 읽을 수 없습니다. 보관함을 확인해 주세요.")
@@ -85,6 +88,7 @@ extension Launcher {
             throw DecodingError.dataCorruptedError(forKey: .kind, in: values, debugDescription: "unknown program kind")
         }
         kind = parsed
+        displayMode = try values.decodeIfPresent(String.self, forKey: .displayMode)
         addon = try values.decodeIfPresent(String.self, forKey: .addon)
         privatePrefix = try values.decodeIfPresent(Bool.self, forKey: .privatePrefix) ?? false
     }
@@ -684,6 +688,79 @@ extension LauncherStore {
                 #"[HKEY_LOCAL_MACHINE\System\CurrentControlSet\Hardware Profiles\Current\Software\Fonts]"#, #""LogPixels"=dword:"# + dpi, "",
                 #"[HKEY_CURRENT_USER\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers]"#, on ? #"@="~ DPIUNAWARE""# : "@=-", ""]
             .joined(separator: "\r\n")
+    }
+
+    /// How an environment draws: the default (Retina off), at the Retina screen's own resolution,
+    /// or at point size and scaled up to the Retina size by DXMT's MetalFX spatial upscaler.
+    enum DisplayChoice: Equatable { case standard, retina, metalFX }
+    static let metalFXSwapchainName = "DXMT_METALFX_SPATIAL_SWAPCHAIN"
+    static let metalFXConfigName = "DXMT_CONFIG"
+    static let metalFXFactorKey = "d3d11.metalSpatialUpscaleFactor"
+    static let metalFXFactor = 2
+
+    /// The `key=value` pairs of a DXMT_CONFIG value (separated by `;`), without empty ones.
+    static func configPairs(_ config: String?) -> [String] {
+        (config ?? "").split(separator: ";").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+    private static func configKey(_ pair: String) -> String {
+        pair.split(separator: "=", maxSplits: 1).first.map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+    }
+    /// The MetalFX upscale factor in a DXMT_CONFIG value, if it has one.
+    static func upscaleFactor(config: String?) -> Double? {
+        guard let pair = configPairs(config).first(where: { configKey($0) == metalFXFactorKey }),
+              let value = pair.split(separator: "=", maxSplits: 1).dropFirst().first else { return nil }
+        return Double(value.trimmingCharacters(in: .whitespaces))
+    }
+    /// A DXMT_CONFIG value with only the upscale pair added, replaced (`factor`) or removed (nil); other pairs are kept
+    /// in order. nil means the value should not exist (nothing is left).
+    static func dxmtConfig(_ existing: String?, factor: Int?) -> String? {
+        var pairs = configPairs(existing), placed = false
+        pairs = pairs.compactMap { pair in
+            guard configKey(pair) == metalFXFactorKey else { return pair }
+            guard let factor, !placed else { return nil }
+            placed = true
+            return "\(metalFXFactorKey)=\(factor)"
+        }
+        if let factor, !placed { pairs.append("\(metalFXFactorKey)=\(factor)") }
+        return pairs.isEmpty ? nil : pairs.joined(separator: ";")
+    }
+    /// Whether the environment values (names lower-cased, as `registryValues` returns them) turn the MetalFX upscaler on.
+    static func metalFXEnabled(environment values: [String: String]) -> Bool {
+        values[metalFXSwapchainName.lowercased()] == "1" && (upscaleFactor(config: values[metalFXConfigName.lowercased()]) ?? 0) > 1
+    }
+    /// The display choice a user.reg describes: Retina wins over MetalFX values left behind.
+    static func displayChoice(userReg text: String?) -> DisplayChoice {
+        guard let text else { return .standard }
+        if let mode = registryValues(text, key: #"Software\\Wine\\Mac Driver"#)["retinamode"]?.lowercased().first, "yt1".contains(mode) { return .retina }
+        return metalFXEnabled(environment: registryValues(text, key: "Environment")) ? .metalFX : .standard
+    }
+    func displayChoice(prefix: URL) -> DisplayChoice {
+        Self.displayChoice(userReg: try? String(contentsOf: prefix.appendingPathComponent("user.reg"), encoding: .utf8))
+    }
+    func displayChoice(environment: String?) -> DisplayChoice { displayChoice(prefix: prefix(environment: environment)) }
+    private static func regString(_ value: String) -> String {
+        "\"" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+    }
+    /// Settings regedit applies to switch an environment to a display choice. Retina on removes the MetalFX values;
+    /// MetalFX turns Retina off (the same settings as the default) and sets the two environment values; the default
+    /// removes MetalFX values only if there are some. Other DXMT_CONFIG pairs the environment has are kept.
+    static func displayRegistry(_ choice: DisplayChoice, userReg text: String?) -> String {
+        let values = registryValues(text ?? "", key: "Environment")
+        let config = values[metalFXConfigName.lowercased()]
+        var lines: [String] = []
+        if choice == .metalFX {
+            lines = ["\"\(metalFXSwapchainName)\"=" + regString("1"),
+                     dxmtConfig(config, factor: metalFXFactor).map { "\"\(metalFXConfigName)\"=" + regString($0) } ?? "\"\(metalFXConfigName)\"=-"]
+        } else if values[metalFXSwapchainName.lowercased()] != nil || upscaleFactor(config: config) != nil {
+            lines = ["\"\(metalFXSwapchainName)\"=-",
+                     dxmtConfig(config, factor: nil).map { "\"\(metalFXConfigName)\"=" + regString($0) } ?? "\"\(metalFXConfigName)\"=-"]
+        }
+        var out = retinaRegistry(on: choice == .retina)
+        if !lines.isEmpty { out += ([#"[HKEY_CURRENT_USER\Environment]"#] + lines + [""]).joined(separator: "\r\n") }
+        return out
+    }
+    func displayRegistry(_ choice: DisplayChoice, prefix: URL) -> String {
+        Self.displayRegistry(choice, userReg: try? String(contentsOf: prefix.appendingPathComponent("user.reg"), encoding: .utf8))
     }
 
     /// A .reg file for regedit, kept beside the library and removed by the caller.

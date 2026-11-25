@@ -399,6 +399,7 @@ final class SessionController: ObservableObject {
             try? FileManager.default.removeItem(at: outer)
             throw error
         }
+        AlchemacRuntime.markGameBundlesLater(process: next, seconds: migrating ? 180 : 10)
         session.after = then
         session.runningMessage = running
         if migrating {

@@ -61,7 +61,10 @@ func runApplication() {
     programMenu.addItem(command("이름 변경…", #selector(AppDelegate.menuRename(_:))))
     let screen = NSMenu(title: "화면 설정")
     screen.addItem(command("크기 보정 켜기 (작게 보일 때)", #selector(AppDelegate.menuToggleScaled(_:))))
-    screen.addItem(command("선명한 화면(Retina) 켜기", #selector(AppDelegate.menuToggleRetina(_:))))
+    screen.addItem(command("선명한 화면(Retina)", #selector(AppDelegate.menuToggleRetina(_:))))
+    let metalFXItem = command("성능 우선(MetalFX 업스케일)", #selector(AppDelegate.menuToggleMetalFX(_:)))
+    metalFXItem.toolTip = "낮은 해상도로 그린 뒤 Apple MetalFX로 Retina 크기로 키웁니다. 프레임은 오르고 글자는 Retina보다 조금 부드럽습니다. Direct3D 11 게임에만 적용됩니다."
+    screen.addItem(metalFXItem)
     let screenItem = NSMenuItem(title: "화면 설정", action: nil, keyEquivalent: ""); screenItem.submenu = screen
     programMenu.addItem(screenItem)
     programMenu.addItem(.separator())

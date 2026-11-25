@@ -28,6 +28,7 @@ enum AlchemacRuntime {
         try prepare(process, session: "alchemac-" + launcher.id, target: try store.windowsExecutable(launcher),
                     workdir: try store.game(launcher), prefix: try store.prefix(launcher), logs: launcher.id,
                     settings: settings, mode: launcher.scaled ? "--launch-scaled" : "--launch",
+                    displayMode: launcher.displayMode,
                     store: store, runtime: runtime, resources: resources)
     }
 
@@ -88,7 +89,7 @@ enum AlchemacRuntime {
     }
 
     private static func prepare(_ process: Process, session: String, target: String, workdir: URL, prefix: URL, logs name: String,
-                                settings: [String: String], mode: String = "--launch", store: LauncherStore, runtime: URL, resources: URL?) throws {
+                                settings: [String: String], mode: String = "--launch", displayMode: String? = nil, store: LauncherStore, runtime: URL, resources: URL?) throws {
         let fm = FileManager.default
         let script = runtime.appendingPathComponent("scripts/standalone-run")
         let assets = resources ?? runtime.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Resources")
@@ -108,6 +109,10 @@ enum AlchemacRuntime {
         // Prepare this locked prefix, then start the program as a child.
         // standalone-run waits for the whole Wine session, not just this helper.
         process.arguments = [session, profile.path, mode, windows(font), target]
+        if let displayMode {
+            guard DisplayModeSpec.parse(displayMode) != nil else { throw AlchemacError.message("화면 모드 설정이 올바르지 않습니다. 예: 1960x1274") }
+            process.arguments! += ["--display-mode", displayMode]
+        }
         // A new environment has no drive_c yet; the launch directory must exist, HADRON_WORKDIR may still name it.
         process.currentDirectoryURL = fm.fileExists(atPath: workdir.path) ? workdir : prefix.deletingLastPathComponent()
         // No inherited host tokens, Wine/CrossOver state, DYLD injection or shell evaluation.
@@ -133,6 +138,86 @@ enum AlchemacRuntime {
         // standalone-run creates an absent prefix next to itself, so its parent must exist.
         try fm.createDirectory(at: prefix.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try fm.createDirectory(at: URL(fileURLWithPath: logsPath, isDirectory: true), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        markGameBundles(process: process)
+    }
+
+    // MARK: Game Mode
+
+    private static let lsregister = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+    /// The Dock bundles `play` writes for this environment: `<scope>/apps/<id>/<name>.app`.
+    static func gameBundles(process: Process) -> [URL] {
+        guard let support = process.environment?["HADRON_SUPPORT"], let prefix = process.environment?["WINEPREFIX"],
+              let scope = OrphanSessions.scopeDirectory(support: URL(fileURLWithPath: support, isDirectory: true), prefix: URL(fileURLWithPath: prefix, isDirectory: true)) else { return [] }
+        let fm = FileManager.default
+        let apps = scope.appendingPathComponent("apps", isDirectory: true)
+        var found: [URL] = []
+        for id in (try? fm.contentsOfDirectory(atPath: apps.path)) ?? [] {
+            let folder = apps.appendingPathComponent(id, isDirectory: true)
+            for name in (try? fm.contentsOfDirectory(atPath: folder.path)) ?? [] where name.hasSuffix(".app") {
+                found.append(folder.appendingPathComponent(name, isDirectory: true))
+            }
+        }
+        return found
+    }
+
+    /// Adds the games category to one bundle's Info.plist and registers the bundle with LaunchServices. Only files inside
+    /// `scope` are touched, and no path component below it may be a link. Returns whether the plist was changed.
+    @discardableResult
+    static func markAsGame(bundle: URL, scope: URL) -> Bool {
+        func isPlain(_ path: String, directory: Bool) -> Bool {
+            var info = stat()
+            guard lstat(path, &info) == 0 else { return false }
+            return directory ? (info.st_mode & S_IFMT) == S_IFDIR : (info.st_mode & S_IFMT) == S_IFREG
+        }
+        guard let root = realpath(scope.path, nil) else { return false }
+        defer { free(root) }
+        let rootPath = String(cString: root)
+        let plist = bundle.appendingPathComponent("Contents/Info.plist")
+        // standardizedFileURL would shorten /private/var and /private/tmp, so resolve the parent folders with realpath.
+        guard let parent = realpath(plist.deletingLastPathComponent().path, nil) else { return false }
+        defer { free(parent) }
+        let parts = String(cString: parent) + "/" + plist.lastPathComponent
+        guard parts.hasPrefix(rootPath + "/") else { return false }
+        // Every folder between the scope and the file, then the file, must be real (not a link).
+        var walk = rootPath
+        let relative = parts.dropFirst(rootPath.count + 1).split(separator: "/").map(String.init)
+        for (index, part) in relative.enumerated() {
+            walk += "/" + part
+            guard isPlain(walk, directory: index < relative.count - 1) else { return false }
+        }
+        guard let data = FileManager.default.contents(atPath: plist.path) else { return false }
+        guard case .changed(let output) = GameModeCategory.updated(plist: data) else { return false }
+        let mode = (try? FileManager.default.attributesOfItem(atPath: plist.path)[.posixPermissions] as? Int) ?? 0o644
+        do { try output.write(to: plist, options: .atomic) } catch { return false }
+        try? FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: plist.path)
+        // Best effort: a failed registration only means Game Mode starts with the next launch.
+        let register = Process()
+        register.executableURL = URL(fileURLWithPath: lsregister)
+        register.arguments = ["-f", bundle.path]
+        register.standardOutput = FileHandle.nullDevice
+        register.standardError = FileHandle.nullDevice
+        do { try register.run(); register.waitUntilExit() } catch { NSLog("Alchemac: lsregister failed: \(error)") }
+        return true
+    }
+
+    /// Before the launch: bundles an earlier run left behind get the category at once.
+    static func markGameBundles(process: Process) {
+        guard let support = process.environment?["HADRON_SUPPORT"], let prefix = process.environment?["WINEPREFIX"],
+              let scope = OrphanSessions.scopeDirectory(support: URL(fileURLWithPath: support, isDirectory: true), prefix: URL(fileURLWithPath: prefix, isDirectory: true)) else { return }
+        for bundle in gameBundles(process: process) { markAsGame(bundle: bundle, scope: scope) }
+    }
+
+    /// After the start: `play` writes the bundle on the first run (or after a runtime change), so look again for a while.
+    /// A change made this late only reaches the next launch, since the game window already exists.
+    static func markGameBundlesLater(process: Process, seconds: Int) {
+        DispatchQueue.global(qos: .utility).async {
+            for _ in 0..<(seconds * 2) {
+                Thread.sleep(forTimeInterval: 0.5)
+                guard process.isRunning else { return }
+                markGameBundles(process: process)
+            }
+        }
     }
 
     static func windows(_ path: URL) -> String { "Z:" + path.path.replacingOccurrences(of: "/", with: "\\") }
